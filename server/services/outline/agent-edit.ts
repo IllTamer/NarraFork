@@ -14,16 +14,24 @@
  *      `[[key/sid]]`, as does a reference to a block added by the same call; a display text that
  *      repeats the target's title is dropped; anything else stays as written and is reported.
  *      `alias:: Q?` takes the next free number of that prefix in the space.
- *   4. Check what the agent read: a block it is changing that someone else changed after the
- *      agent last read it is a conflict, reported with its current text; nothing is written.
- *      This and the write run behind the live session barrier (`live-barrier.ts`), so edits
- *      still in a page's live session count as changes.
+ *   4. Check what the agent read (the read ledger): a block it is changing that someone else
+ *      changed after the agent last read it is merged when the edit is the block's only one and
+ *      a `replace` (`agent-merge.ts`: the agent's change from the version it read, applied to
+ *      the block as it is now; text changes that do not overlap and fields only one side
+ *      changed). Anything else is a conflict: an overlap, a field both changed, or a move,
+ *      delete or set of such a block. One conflict refuses the whole call, reported with each
+ *      conflicting block's current text and where it conflicts; nothing is written. This and the
+ *      write run behind the live session barrier (`live-barrier.ts`), so edits still in a
+ *      page's live session count as changes: they are committed first and merged with.
  *   5. Write one transaction with provenance (this narrator as actor, the turn's person as
- *      responsible, the message and tool call), content handed over already normalized.
+ *      responsible, the message and tool call), content handed over already normalized. Merged
+ *      blocks are ordinary updates marked `merged` (`OUTLINE_CHANGE.MERGE` on their versions),
+ *      so the timeline replays them and a revert undoes them like any other commit.
  *
  * The result lists each edit's outcome with the addresses of new blocks, the notes, and hints
- * about the space (a page with the same title already exists). Everything it shows comes from
- * the space being written, which the session may read.
+ * about the space (a page with the same title already exists); merged blocks are shown as they
+ * now read, as a read shows them, and the ledger moves to the version written. Everything it
+ * shows comes from the space being written, which the session may read.
  */
 
 import { NotFoundError } from "@server/lib/errors";
@@ -34,7 +42,8 @@ import {
 	parseAliasValue,
 	TASK_BOX,
 } from "@shared/outline";
-import type { OutlineToolOutput } from "./agent-read";
+import { type AgentMerge, type AgentReplace, mergeAgentReplaces } from "./agent-merge";
+import { blockLinesForAgent, type OutlineToolOutput } from "./agent-read";
 import {
 	type OutlineAgentScope,
 	type OutlineSpaceWord,
@@ -56,7 +65,7 @@ import { OUTLINE_TOOL_TEXT } from "./messages";
 import { OUTLINE_LIMITS } from "./model";
 import { forgetOutlineReads, recordOutlineReads, seenOutlineVersion } from "./read-ledger";
 import type { OutlineResolvedBlock } from "./resolve";
-import type { OutlineSpaceRow } from "./store/port";
+import type { OutlineBlockRow, OutlineCommitRow, OutlineSpaceRow } from "./store/port";
 import {
 	type OutlineBlockRef,
 	type OutlineCanonicalContent,
@@ -111,6 +120,8 @@ export const OUTLINE_EDIT_LIMITS = {
 	maxPageHints: 5,
 	/** Characters of a conflicting block's current text shown. */
 	maxConflictChars: 400,
+	/** UTF-8 bytes of merged blocks' text a result shows; the rest are named only. */
+	maxMergedBytes: 32 * 1024,
 } as const;
 
 const STATUS_OF: Record<Exclude<OutlineCheckbox, "none">, OutlineTaskInput["status"]> = {
@@ -631,14 +642,35 @@ export async function outlineEdit(
 		}
 	}
 
+	// The fields a replace sets besides its text (the ones its text leaves out keep their value).
+	const replaceFields = (p: PlannedItem): Omit<AgentReplace, "blockId" | "seen" | "content"> => {
+		const props = p.item.props;
+		const depends = dependsOf(p.item);
+		const task: OutlineTaskPatch | undefined =
+			p.item.task || depends?.length || props.due
+				? {
+						...(p.item.task ? { status: p.item.task.status } : {}),
+						...(p.item.task?.assignee ? { assignee: p.item.task.assignee } : {}),
+						...(depends?.length ? { depends } : {}),
+						...(props.due ? { due: props.due } : {}),
+					}
+				: undefined;
+		return {
+			...(p.alias !== undefined ? { alias: p.alias } : {}),
+			...(props.tags?.length ? { tags: props.tags.map((t) => t.target) } : {}),
+			...(task ? { task } : {}),
+		};
+	};
+
 	// 4–5 run behind the live session barrier: unflushed live edits of the space are committed
-	// first, so a block someone is typing into counts as changed since the agent read it, and
-	// nothing lands in the space between these checks and the write. Only the checks and the
-	// write run there; reporting a conflict reads afterwards.
-	type Conflict = Parameters<typeof conflictOutput>[2][number];
+	// first, so a block someone is typing into counts as changed since the agent read it (and
+	// what they typed is merged with), and nothing lands in the space between these checks and
+	// the write. Only the checks, the merges, the write and reading back what was merged run
+	// there; reporting reads afterwards.
 	let outcome:
-		| { conflicts: Conflict[] }
+		| { conflicts: ChangedSinceRead[] }
 		| { writeConflict: OutlineConflictError }
+		| { written: OutlineWriteResult; merged: MergedBlock[] }
 		| { output: OutlineToolOutput };
 	try {
 		outcome = await withOutlineLiveBarrier(space.id, async () => {
@@ -655,6 +687,11 @@ export async function outlineEdit(
 				const seen = seenOutlineVersion(scope.narratorId, m.id);
 				return seen !== undefined && m.versionSeq > seen;
 			});
+			/** Blocks to merge, with who changed them since the agent read them. */
+			const merges = new Map<
+				string,
+				{ merge: Extract<AgentMerge, { ok: true }>; why: ChangedSinceRead }
+			>();
 			if (stale.length > 0) {
 				const commits = new Map(
 					(
@@ -663,21 +700,58 @@ export async function outlineEdit(
 						])
 					).map((c) => [c.seq, c]),
 				);
-				const conflicts = stale.filter((m) => {
-					const commit = commits.get(m.versionSeq);
-					return !(commit?.actorKind === "agent" && commit.actorId === scope.narratorId);
-				});
-				if (conflicts.length > 0) {
+				const changed: ChangedSinceRead[] = stale
+					.filter((m) => {
+						const commit = commits.get(m.versionSeq);
+						return !(commit?.actorKind === "agent" && commit.actorId === scope.narratorId);
+					})
+					.map((m) => ({
+						blockId: m.id,
+						sid: m.sid,
+						seen: seenOutlineVersion(scope.narratorId, m.id) as number,
+						now: m.versionSeq,
+						by: commits.get(m.versionSeq),
+					}));
+				// Only a block's one replace is merged; a move, delete or set needs the block as read.
+				const editsOf = new Map<string, EditState[]>();
+				for (const edit of edits) {
+					if (edit.located?.kind !== "block") continue;
+					const id = edit.located.block.id;
+					editsOf.set(id, [...(editsOf.get(id) ?? []), edit]);
+				}
+				const replaceOf = (blockId: string) => {
+					const list = editsOf.get(blockId) ?? [];
+					return list.length === 1 && list[0]?.kind === "replace" ? list[0] : undefined;
+				};
+				const unmergeable = changed.filter((c) => !replaceOf(c.blockId));
+				if (unmergeable.length > 0) {
 					return {
-						conflicts: conflicts.map((m) => ({
-							blockId: m.id,
-							sid: m.sid,
-							seen: seenOutlineVersion(scope.narratorId, m.id) as number,
-							now: m.versionSeq,
-							by: commits.get(m.versionSeq),
+						conflicts: unmergeable.map((c) => ({
+							...c,
+							detail: [OUTLINE_TOOL_TEXT.edit.notMerged],
 						})),
 					};
 				}
+				const replaces: AgentReplace[] = changed.map((c) => {
+					const p = (replaceOf(c.blockId)?.items as PlannedItem[])[0] as PlannedItem;
+					return { blockId: c.blockId, seen: c.seen, content: p.content, ...replaceFields(p) };
+				});
+				let results: AgentMerge[];
+				try {
+					results = await mergeAgentReplaces(scope.store, replaces, {
+						signal: provenance.signal,
+					});
+				} catch (error) {
+					if (error instanceof OutlineEditTextError) return { output: failed([error.message]) };
+					throw error;
+				}
+				const refused: ChangedSinceRead[] = [];
+				results.forEach((r, i) => {
+					const why = changed[i] as ChangedSinceRead;
+					if (r.ok) merges.set(r.blockId, { merge: r, why });
+					else refused.push({ ...why, detail: refusalDetail(r) });
+				});
+				if (refused.length > 0) return { conflicts: refused };
 			}
 			const base = (blockId: string) => current.get(blockId)?.versionSeq;
 
@@ -746,31 +820,28 @@ export async function outlineEdit(
 				} else if ("replace" in r) {
 					const block = (edit.located as { block: OutlineResolvedBlock }).block;
 					const p = (edit.items as PlannedItem[])[0] as PlannedItem;
-					const props = p.item.props;
+					// A merged block takes the merged text and only the fields the merge kept.
+					const merge = merges.get(block.id)?.merge;
+					const fields = merge ?? replaceFields(p);
+					const content = merge ? merge.content : p.content;
 					push(
 						edit,
 						{
 							op: "update",
 							block: { id: block.id },
-							content: p.content,
+							content,
 							baseVersionSeq: base(block.id),
-							...(p.alias !== undefined ? { alias: p.alias } : {}),
-							...(props.tags?.length ? { tags: props.tags.map((t) => t.target) } : {}),
+							...(fields.alias !== undefined ? { alias: fields.alias } : {}),
+							...(fields.tags !== undefined ? { tags: fields.tags } : {}),
+							...(merge ? { merged: true } : {}),
 						},
-						{ content: p.content, links: p.links },
+						{ content, links: merge ? merge.links : p.links },
 					);
-					const depends = dependsOf(p.item);
-					if (p.item.task || depends?.length || props.due) {
-						const task: OutlineTaskPatch = {
-							...(p.item.task ? { status: p.item.task.status } : {}),
-							...(p.item.task?.assignee ? { assignee: p.item.task.assignee } : {}),
-							...(depends?.length ? { depends } : {}),
-							...(props.due ? { due: props.due } : {}),
-						};
+					if (fields.task) {
 						push(edit, {
 							op: "setTask",
 							block: { id: block.id },
-							task,
+							task: fields.task,
 							baseVersionSeq: base(block.id),
 						});
 					}
@@ -871,9 +942,36 @@ export async function outlineEdit(
 				forgetOutlineReads(scope.narratorId, deleted);
 			}
 
-			return {
-				output: successOutput(space, spaceText, edits, result, { globalNotes, hints, meta }),
-			};
+			// Merged blocks as they are now (still behind the barrier: nobody has typed since).
+			// The result shows them, so the ledger records these versions as read.
+			const merged: MergedBlock[] = [];
+			if (merges.size > 0) {
+				const ids = [...merges.keys()];
+				const rows = await scope.store.getBlocks(ids);
+				const tags = await scope.store.listLinksAt(
+					ids,
+					null,
+					["tag"],
+					ids.length * OUTLINE_LIMITS.maxTagsPerBlock,
+				);
+				for (const row of rows) {
+					const why = merges.get(row.id)?.why;
+					if (!why || row.deleted) continue;
+					merged.push({
+						why,
+						row,
+						tags: tags
+							.filter((t) => t.fromBlockId === row.id)
+							.map((t) => t.targetRef)
+							.sort(),
+					});
+				}
+				recordOutlineReads(
+					scope.narratorId,
+					merged.map((m) => [m.row.id, m.row.versionSeq] as const),
+				);
+			}
+			return { written: result, merged };
 		});
 	} catch (error) {
 		// The space's live text could not be committed first: try again shortly.
@@ -882,6 +980,16 @@ export async function outlineEdit(
 	}
 	if ("output" in outcome) return outcome.output;
 	if ("conflicts" in outcome) return await conflictOutput(scope, space, outcome.conflicts, meta);
+	if ("written" in outcome) {
+		return successOutput(
+			space,
+			spaceText,
+			edits,
+			outcome.written,
+			await mergedSection(scope, outcome.merged),
+			{ globalNotes, hints, meta },
+		);
+	}
 	const error = outcome.writeConflict;
 	const metas = new Map(
 		(
@@ -912,16 +1020,63 @@ export async function outlineEdit(
 	);
 }
 
+/** A block someone else changed after the agent read it: who, and what kept it from merging. */
+interface ChangedSinceRead {
+	blockId: string;
+	sid: string;
+	/** The version the agent read. */
+	seen: number;
+	/** The block's version now. */
+	now: number;
+	by?: Pick<OutlineCommitRow, "actorKind" | "actorId">;
+	/** Why it could not be merged. */
+	detail?: string[];
+}
+
+/** What a result says about the blocks a call merged. */
+interface MergedSection {
+	lines: string[];
+	sids: ReadonlySet<string>;
+}
+
+/** A block merged by this call, as it is after the write. */
+interface MergedBlock {
+	why: ChangedSinceRead;
+	row: OutlineBlockRow;
+	/** Its tags, sorted. */
+	tags: string[];
+}
+
+function whoChanged(by: ChangedSinceRead["by"]): string {
+	return !by
+		? OUTLINE_TOOL_TEXT.edit.someone
+		: by.actorKind === "human"
+			? OUTLINE_TOOL_TEXT.edit.aPerson
+			: by.actorKind === "agent"
+				? OUTLINE_TOOL_TEXT.edit.anotherAgent
+				: OUTLINE_TOOL_TEXT.edit.theSystem;
+}
+
+/** Why a merge was refused, as lines under the block's conflict. */
+function refusalDetail(refused: Extract<AgentMerge, { ok: false }>): string[] {
+	switch (refused.reason) {
+		case "overlap":
+			return [OUTLINE_TOOL_TEXT.edit.overlaps(refused.overlaps ?? [])];
+		case "fields":
+			return [OUTLINE_TOOL_TEXT.edit.bothChanged(refused.fields ?? [])];
+		case "unstable":
+			return [OUTLINE_TOOL_TEXT.edit.mergeUnstable];
+		case "no-base":
+			return [OUTLINE_TOOL_TEXT.edit.noBase];
+		case "deleted":
+			return [];
+	}
+}
+
 async function conflictOutput(
 	scope: OutlineAgentScope,
 	space: OutlineSpaceRow,
-	conflicts: Array<{
-		blockId: string;
-		sid: string;
-		seen: number;
-		now: number;
-		by?: { actorKind: string; actorId: string };
-	}>,
+	conflicts: ChangedSinceRead[],
 	meta: Record<string, unknown>,
 ): Promise<OutlineToolOutput> {
 	const blocks = new Map(
@@ -929,14 +1084,8 @@ async function conflictOutput(
 	);
 	const lines: string[] = [OUTLINE_TOOL_TEXT.edit.conflictHeader];
 	for (const c of conflicts) {
-		const who = !c.by
-			? OUTLINE_TOOL_TEXT.edit.someone
-			: c.by.actorKind === "human"
-				? OUTLINE_TOOL_TEXT.edit.aPerson
-				: c.by.actorKind === "agent"
-					? OUTLINE_TOOL_TEXT.edit.anotherAgent
-					: OUTLINE_TOOL_TEXT.edit.theSystem;
-		lines.push(`- ${OUTLINE_TOOL_TEXT.edit.conflict(c.sid, who, c.now, c.seen)}`);
+		lines.push(`- ${OUTLINE_TOOL_TEXT.edit.conflict(c.sid, whoChanged(c.by), c.now, c.seen)}`);
+		for (const detail of c.detail ?? []) lines.push(`  ${detail}`);
 		const block = blocks.get(c.blockId);
 		if (block && !block.deleted) {
 			const text = clip(block.content.split("\n").join(" "), OUTLINE_EDIT_LIMITS.maxConflictChars);
@@ -962,17 +1111,66 @@ function itemLines(items: readonly PlannedItem[], depth: number, out: string[]):
 	}
 }
 
+/**
+ * The merged blocks as a read shows them (the short id after the bullet, links with their
+ * targets' titles), within {@link OUTLINE_EDIT_LIMITS.maxMergedBytes}; the rest are only named.
+ */
+async function mergedSection(
+	scope: OutlineAgentScope,
+	merged: readonly MergedBlock[],
+): Promise<MergedSection> {
+	if (merged.length === 0) return { lines: [], sids: new Set() };
+	const rendered = await blockLinesForAgent(
+		scope,
+		merged.map((m) => ({
+			id: m.row.id,
+			sid: m.row.sid,
+			parentId: m.row.parentId,
+			orderKey: m.row.orderKey,
+			alias: m.row.alias,
+			task: m.row.taskJson,
+			versionSeq: m.row.versionSeq,
+			parent: null,
+			children: [],
+			content: m.row.content,
+			tags: m.tags,
+		})),
+	);
+	const lines: string[] = [OUTLINE_TOOL_TEXT.edit.mergedHeader];
+	const unshown: string[] = [];
+	let bytes = 0;
+	for (const m of merged) {
+		const text = rendered.get(m.row.id) ?? "";
+		const size = Buffer.byteLength(text, "utf8");
+		if (bytes > 0 && bytes + size > OUTLINE_EDIT_LIMITS.maxMergedBytes) {
+			unshown.push(`[${m.row.sid}]`);
+			continue;
+		}
+		bytes += size;
+		const { why } = m;
+		lines.push(
+			`‹${OUTLINE_TOOL_TEXT.edit.mergedBlock(why.sid, whoChanged(why.by), why.now, why.seen)}›`,
+		);
+		lines.push(text);
+	}
+	if (unshown.length > 0) lines.push(`‹${OUTLINE_TOOL_TEXT.edit.mergedNotShown(unshown)}›`);
+	return { lines, sids: new Set(merged.map((m) => m.row.sid)) };
+}
+
 function successOutput(
 	space: OutlineSpaceRow,
 	spaceText: string,
 	edits: readonly EditState[],
 	result: OutlineWriteResult,
+	merged: MergedSection,
 	extra: { globalNotes: string[]; hints: string[]; meta: Record<string, unknown> },
 ): OutlineToolOutput {
+	const mergedMeta =
+		merged.sids.size > 0 ? { merged: [...merged.sids].map((sid) => `${space.key}/${sid}`) } : {};
 	if (!result.commit) {
 		return {
-			output: OUTLINE_TOOL_TEXT.edit.noChange,
-			metadata: { ...extra.meta, commit: null },
+			output: [OUTLINE_TOOL_TEXT.edit.noChange, ...merged.lines].join("\n"),
+			metadata: { ...extra.meta, commit: null, ...mergedMeta },
 		};
 	}
 	const lines = [OUTLINE_TOOL_TEXT.edit.committed(result.commit.seq, spaceText, edits.length)];
@@ -991,7 +1189,9 @@ function successOutput(
 			summary.push({ op: "add", created });
 		} else if ("replace" in r) {
 			const sid = firstResult?.sid ?? "";
-			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.replaced(sid)}`);
+			lines.push(
+				`${n}. ${merged.sids.has(sid) ? OUTLINE_TOOL_TEXT.edit.replacedMerged(sid) : OUTLINE_TOOL_TEXT.edit.replaced(sid)}`,
+			);
 			const children = (edit.items?.[0]?.children ?? []) as PlannedItem[];
 			if (children.length > 0) itemLines(children, 1, lines);
 			summary.push({ op: "replace", address: `${space.key}/${sid}` });
@@ -1022,6 +1222,7 @@ function successOutput(
 			summary.push({ op: "set", address: `${space.key}/${sid}` });
 		}
 	}
+	lines.push(...merged.lines);
 	const notes = [...edits.flatMap((edit) => edit.notes), ...extra.globalNotes];
 	if (notes.length > 0)
 		lines.push(OUTLINE_TOOL_TEXT.edit.notesHeader, ...notes.map((n) => `- ${n}`));
@@ -1035,6 +1236,7 @@ function successOutput(
 			commit: result.commit,
 			edits: summary,
 			notes: notes.length,
+			...mergedMeta,
 		},
 	};
 }

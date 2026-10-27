@@ -51,6 +51,16 @@ export const OUTLINE_TEXT = {
 
 export type OutlineRevertSkipReason = keyof typeof OUTLINE_TEXT.revertSkipped;
 
+/** How a merge names the fields of a block (`agent-merge.ts`). */
+const MERGE_FIELD_NAMES: Record<string, string> = {
+	checkbox: "checkbox",
+	assignee: "assignee",
+	depends: "prerequisites (depends::)",
+	due: "due date",
+	alias: "alias",
+	tags: "tags",
+};
+
 function list(items: readonly string[], max = 6): string {
 	const shown = items.slice(0, max).join(", ");
 	return items.length > max ? `${shown} and ${items.length - max} more` : shown;
@@ -158,7 +168,7 @@ export const OUTLINE_TOOL_TEXT = {
 			`a page titled ${quoted(title)} already existed: ${list(addresses.map((a) => `[[${a}]]`))}; merge them if they are the same`,
 		busy: "the space kept changing while the edit was written; nothing was written, try again",
 		conflictHeader:
-			"Nothing was written: blocks you are changing changed after you last read them.",
+			"Nothing was written: blocks you are changing changed after you last read them, and your edits could not be merged with those changes.",
 		someone: "someone",
 		aPerson: "a person",
 		anotherAgent: "another agent",
@@ -166,6 +176,15 @@ export const OUTLINE_TOOL_TEXT = {
 		conflict: (sid: string, who: string, now: number, seen: number) =>
 			`[${sid}] was changed by ${who} in commit #${now} (you read it as of #${seen})`,
 		nowReads: (text: string) => `it now reads: ${text}`,
+		notMerged:
+			"only a block's one replace is merged with later changes; a move, delete or set (or several edits of one block) needs the block as you read it",
+		overlaps: (excerpts: readonly string[]) =>
+			`your change and theirs overlap at ${list(excerpts.map((e) => `«${e}»`))}`,
+		bothChanged: (fields: readonly string[]) =>
+			`you and they both changed its ${list(fields.map((f) => MERGE_FIELD_NAMES[f] ?? f))}`,
+		mergeUnstable:
+			"your change and theirs meet in the same formatting, so the merged text would not read as either of you wrote it",
+		noBase: "the version you read is no longer in its history, so there is nothing to merge from",
 		nowDeleted: "it is deleted now",
 		conflictRecover: (key: string) =>
 			`Read those blocks again with OutlineRead (${key}/<id>), then redo the edit on what they say now.`,
@@ -175,6 +194,14 @@ export const OUTLINE_TOOL_TEXT = {
 		topLevel: "the top level (it is a page now)",
 		added: (where: string | null) => (where ? `added under ${where}:` : "added new pages:"),
 		replaced: (sid: string) => `replaced [${sid}]`,
+		replacedMerged: (sid: string) =>
+			`replaced [${sid}], merged with changes made after you read it (shown below)`,
+		mergedHeader:
+			"Merged: these blocks had been changed by someone else after you read them. Your edits were applied on top of those changes where they did not overlap; they now read as follows (build further edits on this text):",
+		mergedBlock: (sid: string, who: string, now: number, seen: number) =>
+			`[${sid}] changed by ${who} in commit #${now} after you read it as of #${seen}; merged:`,
+		mergedNotShown: (sids: readonly string[]) =>
+			`also merged, not shown here: ${list(sids, 20)}; read them before changing them again`,
 		moved: (sid: string, where: string) => `moved [${sid}] under ${where}`,
 		deleted: (sid: string) => `deleted [${sid}] and everything under it`,
 		noCheckbox: "no checkbox",
