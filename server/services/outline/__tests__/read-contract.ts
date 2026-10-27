@@ -536,6 +536,64 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "versions by key; a merged update says so on its version and reverts like any",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const created = await write(ctx, space, [
+				{ op: "insert", parent: null, content: "v1", task: { status: "todo" }, alias: "K1" },
+			]);
+			const id = a0(created);
+			const s1 = created.commit?.seq as number;
+			const s2 = (await write(ctx, space, [{ op: "update", block: { id }, content: "v2" }])).commit
+				?.seq as number;
+			const merged = await write(ctx, space, [
+				{ op: "update", block: { id }, content: "v3", merged: true },
+			]);
+			const s3 = merged.commit?.seq as number;
+			// A merged update that changes nothing writes nothing.
+			const same = await write(ctx, space, [
+				{ op: "update", block: { id }, content: "v3", merged: true },
+			]);
+			expect(same.commit).toBeNull();
+			const reverted = await revert(ctx, merged.commit?.id as string);
+			const s4 = reverted.commit?.seq as number;
+			const s5 = (await write(ctx, space, [{ op: "delete", block: { id } }])).commit?.seq as number;
+			expect((await ctx.store.getBlock(id))?.content).toBe("v2");
+
+			// Exact keys only; unknown ones are left out, in any number.
+			const keys = [s1, s2, s3, s4, s5].map((fromSeq) => ({ blockId: id, fromSeq }));
+			const unknown = Array.from({ length: 300 }, (_, i) => ({
+				blockId: `missing-${i}`,
+				fromSeq: s1,
+			}));
+			const versions = await ctx.store.listVersionsByKey([
+				...keys,
+				{ blockId: id, fromSeq: s5 + 1 },
+				...unknown,
+			]);
+			const at = new Map(versions.map((v) => [v.fromSeq, v]));
+			expect([...at.keys()].sort((x, y) => x - y)).toEqual([s1, s2, s3, s4, s5]);
+			expect(versions.every((v) => v.blockId === id)).toBe(true);
+			expect(at.get(s1)).toMatchObject({
+				toSeq: s2,
+				content: "v1",
+				taskJson: { status: "todo", assignee: null },
+				alias: "K1",
+				deleted: false,
+				commitId: created.commit?.id,
+			});
+			expect(at.get(s5)).toMatchObject({ content: null, deleted: true, toSeq: null });
+			const isMerge = (seq: number) =>
+				((at.get(seq)?.changeFlags ?? 0) & OUTLINE_CHANGE.MERGE) !== 0;
+			expect([s1, s2, s3, s4, s5].map(isMerge)).toEqual([false, false, true, false, false]);
+			expect((at.get(s3)?.changeFlags ?? 0) & OUTLINE_CHANGE.CONTENT).toBe(OUTLINE_CHANGE.CONTENT);
+			expect(at.get(s4)?.content).toBe("v2");
+			const dump = await ctx.dump(space.id);
+			checkSpaceInvariants(dump);
+			checkChangeFlags(dump);
+		},
+	},
+	{
 		name: "page lists and block history: sibling order, cursors, heads, newest first",
 		async run(ctx) {
 			const space = await personalSpace(ctx);

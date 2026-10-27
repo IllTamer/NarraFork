@@ -187,6 +187,23 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 			return out;
 		},
 
+		async listVersionsByKey(keys) {
+			const out: OutlineVersionRow[] = [];
+			for (const chunk of chunked(keys, VERSION_KEY_CHUNK)) {
+				const pairs = sql.join(
+					chunk.map((k) => sql`(CAST(${k.blockId} AS text), CAST(${k.fromSeq} AS integer))`),
+					sql`, `,
+				);
+				const v = outlineBlockVersions;
+				const rows = await db
+					.select()
+					.from(v)
+					.where(sql`(${v.blockId}, ${v.fromSeq}) IN (VALUES ${pairs})`);
+				for (const row of rows) out.push(toVersion(row));
+			}
+			return out;
+		},
+
 		async listLinksAt(blockIds, seq, kinds, limit) {
 			const out: OutlineLinkRow[] = [];
 			if (kinds.length === 0) return out;

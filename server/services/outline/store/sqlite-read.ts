@@ -271,6 +271,24 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		return out;
 	},
 
+	async listVersionsByKey(keys) {
+		const out: OutlineVersionRow[] = [];
+		const v = outlineBlockVersions;
+		for (const chunk of chunked(keys, VERSION_KEY_SIZES[VERSION_KEY_SIZES.length - 1])) {
+			const pairs = sql.join(
+				chunk.map((k) => sql`(${k.blockId}, ${k.fromSeq})`),
+				sql`, `,
+			);
+			const rows = db
+				.select()
+				.from(v)
+				.where(sql`(${v.blockId}, ${v.fromSeq}) IN (VALUES ${pairs})`)
+				.all();
+			for (const row of rows) out.push(toVersion(row));
+		}
+		return out;
+	},
+
 	async listLinksAt(blockIds, seq, kinds, limit) {
 		const out: OutlineLinkRow[] = [];
 		if (kinds.length === 0) return out;

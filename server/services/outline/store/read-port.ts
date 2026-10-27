@@ -107,6 +107,13 @@ export interface OutlineReadPort {
 	listVersionContents(
 		keys: ReadonlyArray<{ blockId: string; fromSeq: number }>,
 	): Promise<Array<{ blockId: string; fromSeq: number; content: string | null }>>;
+	/**
+	 * Whole versions by exact key (`block_id`, `from_seq`), one primary-key lookup each: the
+	 * version an agent read, which its edit is merged from. Keys with no version are left out.
+	 */
+	listVersionsByKey(
+		keys: ReadonlyArray<{ blockId: string; fromSeq: number }>,
+	): Promise<OutlineVersionRow[]>;
 	/** Links of the given blocks and kinds valid at `seq` (`null`: open links), at most `limit`. */
 	listLinksAt(
 		blockIds: readonly string[],
