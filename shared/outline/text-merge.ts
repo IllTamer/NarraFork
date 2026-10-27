@@ -3,12 +3,15 @@
  * local edits are diffed against what it last showed and rebased over remote changes) and the
  * server (a write made outside the live session is merged into the session's text).
  *
- * Diffs work on tokens (a word, one CJK character, a run of whitespace, one other character) so
- * a hunk never splits a word, and come out as character ranges. The token diff is Myers' with a
- * bounded edit distance: past {@link MAX_EDIT_TOKENS} differing tokens, or once the work would
- * exceed {@link MAX_DIFF_WORK}, the middle is replaced as one hunk. A coarser diff is still a
- * correct diff (applying it gives the target); it only merges less finely, which matters for
- * strict merges and never loses text.
+ * Diffs work on tokens (a word, one CJK character, a run of whitespace, one other character) and
+ * come out as character ranges. `diffHunks` first takes off the common prefix and suffix
+ * character by character (so typing inside a word is a small insertion, which is what the editor
+ * wants), and aligns only the middle on tokens; `diffTokenHunks` aligns the whole text on tokens,
+ * so a change inside a word replaces the word on both sides (what a strict merge compares). The
+ * token diff is Myers' with a bounded edit distance: past {@link MAX_EDIT_TOKENS} differing
+ * tokens, or once the work would exceed {@link MAX_DIFF_WORK}, the middle is replaced as one
+ * hunk. A coarser diff is still a correct diff (applying it gives the target); it only merges
+ * less finely, which matters for strict merges and never loses text.
  *
  * Pure functions: no DOM, no Node globals (the purity guard covers this directory).
  */
@@ -107,7 +110,7 @@ function myers(a: readonly string[], b: readonly string[]): Array<[number, numbe
 	return pairs;
 }
 
-/** Hunks turning `a` into `b`, aligned on tokens (see the module header for the bound). */
+/** Hunks turning `a` into `b`, the middle aligned on tokens (see the module header). */
 export function diffHunks(a: string, b: string): Hunk[] {
 	if (a === b) return [];
 	let p = 0;
@@ -115,10 +118,47 @@ export function diffHunks(a: string, b: string): Hunk[] {
 	while (p < max && a.charCodeAt(p) === b.charCodeAt(p)) p++;
 	let s = 0;
 	while (s < max - p && a.charCodeAt(a.length - 1 - s) === b.charCodeAt(b.length - 1 - s)) s++;
-	const am = a.slice(p, a.length - s);
+	return tokenHunks(
+		a,
+		b,
+		p,
+		s,
+		tokenize(a.slice(p, a.length - s)),
+		tokenize(b.slice(p, b.length - s)),
+	);
+}
+
+/**
+ * Hunks turning `a` into `b`, aligned on whole tokens of both: a hunk starts and ends where
+ * tokens of `a` and of `b` start and end, so a change inside a word replaces the word.
+ */
+export function diffTokenHunks(a: string, b: string): Hunk[] {
+	if (a === b) return [];
+	const ta = tokenize(a);
+	const tb = tokenize(b);
+	let i = 0;
+	let p = 0;
+	while (i < ta.length && i < tb.length && ta[i] === tb[i]) p += (ta[i++] as string).length;
+	let j = 0;
+	let s = 0;
+	while (j < ta.length - i && j < tb.length - i && ta[ta.length - 1 - j] === tb[tb.length - 1 - j])
+		s += (ta[ta.length - 1 - j++] as string).length;
+	return tokenHunks(a, b, p, s, ta.slice(i, ta.length - j), tb.slice(i, tb.length - j));
+}
+
+/**
+ * Hunks of `a` → `b` given their common prefix (`p` characters) and suffix (`s`) and the tokens
+ * of the middles.
+ */
+function tokenHunks(
+	a: string,
+	b: string,
+	p: number,
+	s: number,
+	ta: readonly string[],
+	tb: readonly string[],
+): Hunk[] {
 	const bm = b.slice(p, b.length - s);
-	const ta = tokenize(am);
-	const tb = tokenize(bm);
 	const pairs = myers(ta, tb);
 	if (pairs === null) return [{ start: p, end: a.length - s, text: bm }];
 	const offA: number[] = [0];
@@ -194,7 +234,12 @@ export function mapOffset(delta: readonly DeltaOp[], pos: number, assoc = 1): nu
 
 export type Merge3Result =
 	| { ok: true; result: string /** Applied to `theirs`, in its coordinates. */; patch: Hunk[] }
-	| { ok: false; current: string; conflicts: Array<{ mine: Hunk; theirs: Hunk }> };
+	| {
+			ok: false;
+			current: string;
+			/** The overlapping changes, as ranges of `base` (strict merges align them on tokens). */
+			conflicts: Array<{ mine: Hunk; theirs: Hunk }>;
+	  };
 
 function overlaps(a: Hunk, b: Hunk): boolean {
 	const aIns = a.start === a.end;
@@ -210,7 +255,10 @@ function overlaps(a: Hunk, b: Hunk): boolean {
  * meanwhile).
  *
  *   - strict (the default): changes that overlap theirs reject the merge, returning `theirs`
- *     as the current text (an agent re-reads instead of writing over someone's edit);
+ *     as the current text (an agent re-reads instead of writing over someone's edit). Both
+ *     sides are diffed on whole tokens (`diffTokenHunks`), so changes to one word overlap even
+ *     where their characters do not (`two` → `TWO` against `two` → `twos`); changes that only
+ *     touch (one ends where the other starts) do not, except two insertions at one place;
  *   - `lenient`: never rejects; an overlapping hunk is placed where its start maps to, and an
  *     insertion at the same place as theirs goes after theirs. Used where both sides are kept
  *     no matter what (a person's replayed edits, an outside write into a live session).
@@ -221,11 +269,12 @@ export function merge3(
 	theirs: string,
 	opts: { lenient?: boolean } = {},
 ): Merge3Result {
-	const mh0 = diffHunks(base, mine);
+	const diff = opts.lenient ? diffHunks : diffTokenHunks;
+	const mh0 = diff(base, mine);
 	if (base === theirs) return { ok: true, result: mine, patch: mh0 };
 	if (mine === theirs) return { ok: true, result: theirs, patch: [] };
 	if (mh0.length === 0) return { ok: true, result: theirs, patch: [] };
-	const th = diffHunks(base, theirs);
+	const th = diff(base, theirs);
 	// A change both sides made identically is made once.
 	const same = (a: Hunk, b: Hunk) => a.start === b.start && a.end === b.end && a.text === b.text;
 	const mh = mh0.filter((m) => !th.some((t) => same(m, t)));

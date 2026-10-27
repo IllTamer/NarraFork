@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	applyHunks,
 	diffHunks,
+	diffTokenHunks,
 	hunksToDelta,
 	MAX_EDIT_TOKENS,
 	mapOffset,
@@ -39,7 +40,18 @@ describe("diffs", () => {
 			expect(applyHunks(a, diffHunks(a, b))).toBe(b);
 			const one = simpleDiff(a, b);
 			expect(one ? applyHunks(a, [one]) : a).toBe(b);
+			expect(applyHunks(a, diffTokenHunks(a, b))).toBe(b);
 		}
+	});
+
+	test("token-aligned diffs replace a word changed inside; the editor's diff stays small", () => {
+		expect(diffTokenHunks("one two three", "one twos three")).toEqual([
+			{ start: 4, end: 7, text: "twos" },
+		]);
+		expect(diffHunks("one two three", "one twos three")).toEqual([{ start: 7, end: 7, text: "s" }]);
+		expect(diffTokenHunks("这是重点内容", "这是要点内容")).toEqual([
+			{ start: 2, end: 3, text: "要" },
+		]);
 	});
 
 	test("hunks never split a word, and huge differences stay one hunk", () => {
@@ -76,6 +88,27 @@ describe("three-way merge", () => {
 			expect(lenient.result).toContain("TWO");
 			expect(lenient.result.startsWith("one ")).toBe(true);
 		}
+	});
+
+	test("strict merges compare whole words; changes that only touch still merge", () => {
+		// Inside one word, on different characters: the same word changed twice.
+		expect(merge3("one two three", "one TWO three", "one twos three").ok).toBe(false);
+		expect(merge3("one two three", "one twoo three", "one tAwo three").ok).toBe(false);
+		// Lenient merges keep both, as before.
+		expect(
+			merge3("one two three", "one TWO three", "one twos three", { lenient: true }),
+		).toMatchObject({ ok: true, result: "one TWOs three" });
+		// A word changed, a sentence added right after it.
+		expect(
+			merge3("It takes an hour.", "It takes an hour!", "It takes an hour. Refresh early."),
+		).toMatchObject({ ok: true, result: "It takes an hour! Refresh early." });
+		// One CJK character is one token.
+		expect(merge3("这是重点内容", "这是要点内容", "这是重点内容。")).toMatchObject({
+			ok: true,
+			result: "这是要点内容。",
+		});
+		// Two insertions at one place have no order: they overlap.
+		expect(merge3("a b", "a b c", "a b d").ok).toBe(false);
 	});
 
 	test("the same change on both sides is made once", () => {
