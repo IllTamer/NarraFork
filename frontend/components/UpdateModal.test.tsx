@@ -59,8 +59,41 @@ function install(key: string, value: unknown) {
 	Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
 }
 
+/**
+ * Timers and animation frames scheduled while a test's DOM is installed belong to that DOM.
+ * Mantine's useTransition can outlive its component: when the first animation frame's flushSync
+ * flushes an earlier commit that unmounts the Transition, its cleanup runs first and the frame
+ * callback then still schedules the next frame and a `window.setTimeout` (150 ms) that is never
+ * cleared. If that timer fires after teardown removed `window`, its setState makes React read
+ * `window.event` and the run reports "ReferenceError: window is not defined" between tests.
+ * A browser drops a discarded document's timers; teardown does the same here.
+ */
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
+const domTimers = new Set<ReturnType<typeof setTimeout>>();
+function domSetTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) {
+	const id = realSetTimeout(() => {
+		domTimers.delete(id);
+		callback(...args);
+	}, ms);
+	domTimers.add(id);
+	return id;
+}
+function domClearTimeout(id: ReturnType<typeof setTimeout> | undefined) {
+	if (id === undefined) return;
+	domTimers.delete(id);
+	realClearTimeout(id);
+}
+function cancelDomTimers() {
+	for (const id of domTimers) realClearTimeout(id);
+	domTimers.clear();
+}
+
 beforeEach(() => {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
+	// linkedom's window proxies globalThis, so `window.setTimeout` is this global.
+	install("setTimeout", domSetTimeout);
+	install("clearTimeout", domClearTimeout);
 	for (const key of [
 		"window",
 		"document",
@@ -75,9 +108,9 @@ beforeEach(() => {
 		install(key, key === "window" ? window : window[key as keyof typeof window]);
 	install("IS_REACT_ACT_ENVIRONMENT", true);
 	install("requestAnimationFrame", (callback: FrameRequestCallback) =>
-		setTimeout(() => callback(Date.now()), 0),
+		domSetTimeout(() => callback(Date.now()), 0),
 	);
-	install("cancelAnimationFrame", (id: ReturnType<typeof setTimeout>) => clearTimeout(id));
+	install("cancelAnimationFrame", domClearTimeout);
 	install("matchMedia", () => ({
 		matches: false,
 		addEventListener() {},
@@ -135,6 +168,7 @@ afterEach(async () => {
 	api.getSettings = originalGetSettings;
 	api.updateSettings = originalUpdateSettings;
 	await translation.changeLanguage("en");
+	cancelDomTimers();
 	for (const [key, descriptor] of globals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
