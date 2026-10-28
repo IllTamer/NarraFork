@@ -5,8 +5,10 @@ import {
 	rememberModelTraceRequest,
 } from "@server/lib/agent/modeltrace-request";
 import type { ChatParams, ParsedStreamEvent, ProviderAdapter } from "@server/lib/agent/provider";
+import type { AgentEvent } from "@server/lib/agent/types";
 import { buildModelTracePrompt } from "@server/lib/modeltrace";
 import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
+import type { EventHandlerContext } from "./narrator-event-handler";
 
 const latestRef = mock(async () => ({ messageId: "latest-parent-message" }));
 const childRow = mock(async () => ({ traits: ["modeltrace"], status: "idle" }));
@@ -66,7 +68,39 @@ mock.module("./narrator-persistence", () => ({
 		persistDisplayMessage: persistDisplay,
 		updateConversationId,
 		updateStatus: status,
+		patchStepMeta: (...args: unknown[]) => patchStepMeta(...args),
 	},
+}));
+const patchStepMeta = mock(async (..._args: unknown[]) => {});
+const process = mock(
+	async (
+		event: AgentEvent,
+		ctx: EventHandlerContext,
+		hooks?: { onTitleCheck?: (id: string) => Promise<unknown> },
+	) => {
+		if (event.type === "block_complete") ctx.setPartialMessageId("assistant-row");
+		if (event.type === "assistant_message") {
+			const usage = ctx.getTokenUsage();
+			await persistAssistant(ctx.narratorId, {
+				uuid: event.messageId,
+				credentialId: event.credentialId,
+				model: ctx.model,
+				outputTokens: usage?.completionTokens,
+				cachedInputTokens: usage?.cachedInputTokens,
+				reasoningTokens: usage?.reasoningTokens,
+				message: {
+					content: [{ type: "text", text: event.text }],
+					usage: { input_tokens: usage?.inputTokens, output_tokens: usage?.completionTokens },
+				},
+			});
+			await hooks?.onTitleCheck?.("assistant-row");
+		}
+		return null;
+	},
+);
+mock.module("./narrator-event-handler", () => ({
+	processEvent: process,
+	clearStreamingSnapshot: mock(() => {}),
 }));
 mock.module("./agent-runtime/ownership", () => ({ tryClaimExecution: claim }));
 mock.module("./agent-runtime/inbox", () => ({ wakeInboxIfEligible: wake }));
@@ -102,6 +136,8 @@ beforeEach(() => {
 		fork,
 		persistUser,
 		persistAssistant,
+		process,
+		patchStepMeta,
 		persistDisplay,
 		updateConversationId,
 		status,
@@ -333,8 +369,10 @@ describe("ModelTrace independent single-request probe", () => {
 		expect(finishRequest.mock.calls[0]?.[1]).toMatchObject({
 			usage: { inputTokens: 42, outputTokens: 99 },
 			errorMessage: "assistant write failed",
-			messageId: undefined,
+			messageId: "assistant-row",
 		});
+		expect(patchStepMeta).toHaveBeenCalled();
+		expect(process.mock.calls.some(([event]) => event.type === "stream_reset")).toBe(true);
 		expect(release).toHaveBeenCalledTimes(1);
 	});
 
@@ -391,7 +429,7 @@ describe("ModelTrace independent single-request probe", () => {
 			traits: ["standalone", "modeltrace"],
 			parentNarratorId: "parent",
 		});
-		expect(broadcast).toHaveBeenCalledTimes(2);
+		expect(broadcast).toHaveBeenCalledTimes(1);
 		expect(claim).toHaveBeenCalledWith("probe", "run");
 		expect(status.mock.calls.map((call) => call.slice(0, 2))).toEqual([
 			["probe", "working"],

@@ -6,7 +6,9 @@ import {
 	type ModelTraceRequest,
 	rememberModelTraceRequest,
 } from "@server/lib/agent/modeltrace-request";
+import { OutputContentAccumulator } from "@server/lib/agent/output-content";
 import type { ChatParams, ParsedStreamEvent } from "@server/lib/agent/provider";
+import type { AgentEvent } from "@server/lib/agent/types";
 import { finishApiRequest, startApiRequest } from "@server/lib/api-request-tracker";
 import { ValidationError } from "@server/lib/errors";
 import { hotSafe } from "@server/lib/hot-safe";
@@ -21,6 +23,7 @@ import { buildUsageDataFromSnapshot } from "@server/lib/usage-tracking";
 import { normalizeLocale } from "@shared/i18n-locales";
 import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
 import { desc, eq } from "drizzle-orm";
+import { createRuntimeEventContext } from "./agent-runtime/context";
 import { type ExecutionOwner, tryClaimExecution } from "./agent-runtime/ownership";
 
 // Session interrupt imports cancelModelTrace synchronously. Load persistence, websocket
@@ -95,7 +98,7 @@ async function runProbe(
 	userId: string,
 ): Promise<void> {
 	const { narratorPersistence } = await import("./narrator-persistence");
-	const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
+	const { processEvent, clearStreamingSnapshot } = await import("./narrator-event-handler");
 	const request = startApiRequest({
 		kind: "modeltrace",
 		userId,
@@ -119,6 +122,34 @@ async function runProbe(
 	let failure: unknown;
 	let result: ModelTraceResultBlock | undefined;
 	let stream: AsyncGenerator<ParsedStreamEvent> | undefined;
+	const output = new OutputContentAccumulator();
+	const ctx = createRuntimeEventContext({
+		narratorId: id,
+		conversationId: params.conversationId,
+		provider: snapshot.provider,
+		model: params.model,
+		locale,
+		getTurnStartedAt: () => new Date(startedAt).toISOString(),
+		getTtftMs: () => ttftMs,
+	});
+	let pendingText = "";
+	let lastFlushAt: number | undefined;
+	const dispatch = async (events: Iterable<AgentEvent>) => {
+		for (const event of events) await processEvent(event, ctx);
+	};
+	const flushText = async () => {
+		if (!pendingText) return;
+		const delta = pendingText;
+		pendingText = "";
+		const identity = output.append("text", delta);
+		await processEvent({ type: "stream_text", text: delta, ...identity }, ctx);
+		lastFlushAt = Date.now();
+	};
+	const syncUsage = () => {
+		ctx.setTokenUsage(usage);
+		if (contextPercent !== undefined) ctx.setContextUsagePct(contextPercent);
+		if (metering) ctx.setMeterData(metering.usage, metering.unit);
+	};
 	// This callback belongs only to the probe. Internal transport retries update the
 	// credential on the same handle; they never create extra request/billing rows.
 	params.onRequestStart = (info) => {
@@ -132,9 +163,30 @@ async function runProbe(
 		try {
 			controller.signal.throwIfAborted();
 			stream = snapshot.adapter.chat(params);
+			let nextEvent = stream.next();
 			while (true) {
-				const next = await Promise.race([stream.next(), abort.promise]);
+				// Keep one outstanding iterator read. A short pause still publishes the
+				// final pending delta without waiting for another provider token.
+				let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
+				const due = pendingText
+					? new Promise<null>((resolve) => {
+							coalesceTimer = setTimeout(
+								() => resolve(null),
+								Math.max(0, 40 - (Date.now() - (lastFlushAt ?? 0))),
+							);
+						})
+					: new Promise<never>(() => {});
+				let next: IteratorResult<ParsedStreamEvent> | null;
+				try {
+					next = await Promise.race([nextEvent, abort.promise, due]);
+				} finally {
+					clearTimeout(coalesceTimer);
+				}
 				controller.signal.throwIfAborted();
+				if (next === null) {
+					await flushText();
+					continue;
+				}
 				if (next.done) break;
 				const event = next.value;
 				// Failed terminal events may still carry billable usage and partial text.
@@ -150,7 +202,11 @@ async function runProbe(
 						throw new Error("ModelTrace failed: answer exceeds 10,000 characters");
 					}
 					text += event.text;
+					pendingText += event.text;
 				}
+				syncUsage();
+				if (pendingText && (lastFlushAt === undefined || Date.now() - lastFlushAt >= 40))
+					await flushText();
 				if (
 					event.toolUseChunk ||
 					event.toolUses?.length ||
@@ -180,6 +236,7 @@ async function runProbe(
 						`ModelTrace failed: incomplete response (${event.stopReason.slice(0, 100)})`,
 					);
 				}
+				nextEvent = stream.next();
 			}
 		} catch (error) {
 			failure = error;
@@ -191,39 +248,52 @@ async function runProbe(
 			if (stream) void stream.return(undefined).catch(() => {});
 		}
 		result = failure ? failureReport(failure) : analyzeModelTrace(text, locale);
+		syncUsage();
+		await flushText();
+		await dispatch(output.flush());
+		persistedMessageId = ctx.getPartialMessageId();
 		if (text || usage) {
-			const saved = await narratorPersistence.persistAssistantMessage(id, {
-				uuid: upstreamMessageId ?? randomUUID(),
-				session_id: params.conversationId,
-				message: {
-					content: [{ type: "text", text }],
-					usage: usage
-						? {
-								input_tokens: usage.inputTokens ?? usage.promptTokens,
-								output_tokens: usage.completionTokens,
-							}
-						: undefined,
+			await processEvent(
+				{
+					type: "assistant_message",
+					messageId: upstreamMessageId ?? randomUUID(),
+					text,
+					toolUses: [],
+					credentialId,
+					outputCompleted: !failure,
 				},
-				model: params.model,
-				credentialId,
-				outputTokens: usage?.completionTokens,
-				cachedInputTokens: usage?.cachedInputTokens,
-				cacheCreationInputTokens: usage?.cacheCreationInputTokens,
-				cacheCreation5mTokens: usage?.cacheCreation5mTokens,
-				cacheCreation1hTokens: usage?.cacheCreation1hTokens,
-				reasoningTokens: usage?.reasoningTokens,
-				durationMs: Date.now() - startedAt,
-			});
-			persistedMessageId = saved.id;
-			broadcastToNarrator(id, {
-				type: "message",
-				narratorId: id,
-				message: { ...saved, children: [] },
-			});
+				ctx,
+				{
+					// Usage-only responses have no partial. Observe the native writer's
+					// identity without adding a second persistence/broadcast path.
+					onTitleCheck: async (savedId) => {
+						persistedMessageId = savedId;
+						return null;
+					},
+				},
+			);
 		}
 		await report(id, result);
 	} catch (error) {
 		result = failureReport(error);
+		// Persistence/publication failures must not leave a reconnect ghost or an
+		// open partial. Preserve any durable prefix as interrupted output.
+		try {
+			const partialId = ctx.getPartialMessageId() ?? persistedMessageId;
+			if (partialId) {
+				persistedMessageId = partialId;
+				await narratorPersistence.patchStepMeta(partialId, {
+					durationMs: Date.now() - startedAt,
+					ttftMs,
+				});
+			}
+		} finally {
+			try {
+				await processEvent({ type: "stream_reset" }, ctx);
+			} finally {
+				clearStreamingSnapshot(id);
+			}
+		}
 		await report(id, result);
 	} finally {
 		try {
