@@ -1,7 +1,23 @@
+/**
+ * Prompt optimization, as seen by the composer.
+ *
+ * The request itself lives in `prompt-optimize-tasks` so it survives the composer
+ * unmounting — switching narrator is the common case and used to throw the work
+ * away. These tests pin the composer side of that contract: it triggers the task,
+ * renders its running state, and claims a finished result into ITS OWN surface,
+ * never anybody else's.
+ *
+ * The registry has its own tests for the transport and delivery-ownership rules.
+ */
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import {
+	isNarratorOptimizingPrompt,
+	resetPromptOptimizeTasksForTest,
+	startPromptOptimizeTask,
+} from "../lib/prompt-optimize-tasks";
 
 mock.module("./useInstanceSettings", () => ({
 	useInstanceSettings: () => ({ promptOptimizeContextMaxMessages: 10 }),
@@ -10,6 +26,7 @@ mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) 
 const { usePromptOptimize } = await import("./usePromptOptimize");
 const { narratorsApi } = await import("../lib/api/narrators");
 const { notifications } = await import("@mantine/notifications");
+
 let root: Root;
 let result: ReturnType<typeof usePromptOptimize>;
 let applied: string[];
@@ -20,9 +37,12 @@ let requests: {
 }[];
 const originals = new Map<string, PropertyDescriptor | undefined>();
 let restore: (() => void)[];
+/** Narrator the probe renders; changing it simulates switching narrator. */
+let renderNarratorId = "n";
+
 function Probe() {
 	result = usePromptOptimize({
-		narratorId: "n",
+		narratorId: renderNarratorId,
 		textareaRef: {
 			current: {
 				value: "original",
@@ -35,6 +55,7 @@ function Probe() {
 	});
 	return null;
 }
+
 beforeEach(async () => {
 	const { window } = parseHTML("<html><body></body></html>");
 	for (const [key, value] of Object.entries({
@@ -48,6 +69,8 @@ beforeEach(async () => {
 	Object.assign(document, { execCommand: () => false });
 	applied = [];
 	requests = [];
+	renderNarratorId = "n";
+	resetPromptOptimizeTasksForTest();
 	const api = spyOn(narratorsApi, "optimizePrompt").mockImplementation(
 		(_id, _text, _style, options) =>
 			new Promise((resolve, reject) =>
@@ -63,6 +86,7 @@ beforeEach(async () => {
 	root = createRoot(document.body.appendChild(document.createElement("div")));
 	await act(async () => root.render(<Probe />));
 });
+
 afterEach(async () => {
 	await act(async () => root.unmount());
 	for (const fn of restore) fn();
@@ -71,75 +95,85 @@ afterEach(async () => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 	originals.clear();
+	resetPromptOptimizeTasksForTest();
 });
-test("cancel immediately clears loading and ignores a late successful response", async () => {
-	let pending!: Promise<void>;
+
+/** `handleOptimize` only starts the task, so the transport must be drained separately. */
+async function flush() {
 	await act(async () => {
-		pending = result.handleOptimize("clarify");
+		await Promise.resolve();
+		await Promise.resolve();
+	});
+}
+
+test("cancel immediately clears loading and ignores a late successful response", async () => {
+	await act(async () => {
+		await result.handleOptimize("clarify");
 	});
 	expect(result.loading).toBe(true);
 	await act(async () => result.cancelOptimize());
 	expect(requests[0].signal.aborted).toBe(true);
 	expect(result.loading).toBe(false);
-	await act(async () => {
-		requests[0].resolve({ text: "late" });
-		await pending;
-	});
-	expect(applied).toEqual([]);
-	expect(notifications.show).not.toHaveBeenCalled();
-});
-test("old request rejection cannot clear a newer request's loading", async () => {
-	let first!: Promise<void>;
-	let second!: Promise<void>;
-	await act(async () => {
-		first = result.handleOptimize("clarify");
-	});
-	await act(async () => {
-		second = result.handleOptimize("concise");
-	});
-	await act(async () => {
-		requests[0].reject(new Error("late failure"));
-		await first;
-	});
-	expect(result.loading).toBe(true);
-	expect(notifications.show).not.toHaveBeenCalled();
-	await act(async () => {
-		requests[1].resolve({ text: "new" });
-		await second;
-	});
-	expect(applied).toEqual(["new"]);
-	expect(result.loading).toBe(false);
-});
-test("unmount aborts and suppresses late text and notifications", async () => {
-	let pending!: Promise<void>;
-	await act(async () => {
-		pending = result.handleOptimize("clarify");
-	});
-	await act(async () => root.unmount());
-	expect(requests[0].signal.aborted).toBe(true);
-	requests[0].resolve({ text: "late" });
-	await pending;
+	await act(async () => requests[0].resolve({ text: "late" }));
+	await flush();
 	expect(applied).toEqual([]);
 	expect(notifications.show).not.toHaveBeenCalled();
 });
 
+test("a superseded request cannot deliver after a newer one starts", async () => {
+	await act(async () => {
+		await result.handleOptimize("clarify");
+	});
+	await act(async () => {
+		await result.handleOptimize("concise");
+	});
+	await act(async () => requests[0].reject(new Error("late failure")));
+	await flush();
+	expect(result.loading).toBe(true);
+	await act(async () => requests[1].resolve({ text: "new" }));
+	await flush();
+	expect(applied).toEqual(["new"]);
+	expect(result.loading).toBe(false);
+});
+
 /**
- * What actually lands in the composer.
- *
- * The hook writes the server's `text` verbatim, so the server is responsible for
- * the payload being clean. These tests pin that the hook imposes no rewriting of
- * its own and does not append anything to the returned text — a regression here
- * would show up as thinking or framing leaking into the input box.
+ * The behaviour this whole change exists for: unmounting the composer (which is
+ * what switching narrator does) must NOT kill the request.
  */
+test("unmounting does not abort the request", async () => {
+	await act(async () => {
+		await result.handleOptimize("clarify");
+	});
+	await act(async () => root.unmount());
+	expect(requests[0].signal.aborted).toBe(false);
+	// Nothing is written while no surface exists…
+	await act(async () => requests[0].resolve({ text: "late" }));
+	await flush();
+	expect(applied).toEqual([]);
+});
+
+test("a result that arrives while unmounted is delivered after remount", async () => {
+	await act(async () => {
+		await result.handleOptimize("clarify");
+	});
+	await act(async () => root.unmount());
+	await act(async () => requests[0].resolve({ text: "写一个登录页面。" }));
+	await flush();
+	expect(applied).toEqual([]);
+
+	// Coming back to the same narrator claims the pending result.
+	root = createRoot(document.body.appendChild(document.createElement("div")));
+	await act(async () => root.render(<Probe />));
+	await flush();
+	expect(applied).toEqual(["写一个登录页面。"]);
+});
+
 test("writes the returned text verbatim and notifies success", async () => {
-	let pending!: Promise<void>;
 	await act(async () => {
-		pending = result.handleOptimize("clarify");
+		await result.handleOptimize("clarify");
 	});
-	await act(async () => {
-		requests[0].resolve({ text: "写一个登录页面。" });
-		await pending;
-	});
+	await act(async () => requests[0].resolve({ text: "写一个登录页面。" }));
+	await flush();
 	expect(applied).toEqual(["写一个登录页面。"]);
 	expect(notifications.show).toHaveBeenCalledWith(
 		expect.objectContaining({ message: "optimizeSuccess", color: "green" }),
@@ -150,27 +184,21 @@ test("writes the returned text verbatim and notifies success", async () => {
 test("preserves multi-segment markers in the returned text", async () => {
 	const optimized =
 		"<<<NF_seg_0>>>\n写一个登录页面\n<<<NF_seg_0_END>>>\n<<<NF_seg_1>>>\n补充校验\n<<<NF_seg_1_END>>>";
-	let pending!: Promise<void>;
 	await act(async () => {
-		pending = result.handleOptimize("structured");
+		await result.handleOptimize("structured");
 	});
-	await act(async () => {
-		requests[0].resolve({ text: optimized });
-		await pending;
-	});
+	await act(async () => requests[0].resolve({ text: optimized }));
+	await flush();
 	// Markers are the client's rebuild keys: the hook must not trim or reflow them.
 	expect(applied).toEqual([optimized]);
 });
 
 test("surfaces a server-side failure instead of writing anything", async () => {
-	let pending!: Promise<void>;
 	await act(async () => {
-		pending = result.handleOptimize("clarify");
+		await result.handleOptimize("clarify");
 	});
-	await act(async () => {
-		requests[0].reject(new Error("context too long: no context available"));
-		await pending;
-	});
+	await act(async () => requests[0].reject(new Error("context too long: no context available")));
+	await flush();
 	expect(applied).toEqual([]);
 	expect(notifications.show).toHaveBeenCalledWith(
 		expect.objectContaining({ message: "optimizeNoContext", color: "red" }),
@@ -191,17 +219,16 @@ function summaryCalls() {
 }
 
 test("shows the rationale once when the server returns a summary", async () => {
-	let pending!: Promise<void>;
 	await act(async () => {
-		pending = result.handleOptimize("clarify");
+		await result.handleOptimize("clarify");
 	});
-	await act(async () => {
+	await act(async () =>
 		requests[0].resolve({
 			text: "写一个登录页面。",
 			reasoningSummary: "补充了字段与校验要求。",
-		});
-		await pending;
-	});
+		}),
+	);
+	await flush();
 	const calls = summaryCalls();
 	expect(calls).toHaveLength(1);
 	expect(calls[0][0]).toEqual(
@@ -218,14 +245,11 @@ test("shows the rationale once when the server returns a summary", async () => {
 });
 
 test("does not show a popup when the summary is missing", async () => {
-	let pending!: Promise<void>;
 	await act(async () => {
-		pending = result.handleOptimize("clarify");
+		await result.handleOptimize("clarify");
 	});
-	await act(async () => {
-		requests[0].resolve({ text: "写一个登录页面。" });
-		await pending;
-	});
+	await act(async () => requests[0].resolve({ text: "写一个登录页面。" }));
+	await flush();
 	expect(summaryCalls()).toHaveLength(0);
 	// The success notification still fires.
 	expect(notifications.show).toHaveBeenCalledWith(
@@ -234,41 +258,161 @@ test("does not show a popup when the summary is missing", async () => {
 });
 
 test("does not show a popup when the summary is blank", async () => {
-	let pending!: Promise<void>;
 	await act(async () => {
-		pending = result.handleOptimize("clarify");
+		await result.handleOptimize("clarify");
 	});
-	await act(async () => {
-		requests[0].resolve({ text: "写一个登录页面。", reasoningSummary: "   " });
-		await pending;
-	});
+	await act(async () => requests[0].resolve({ text: "写一个登录页面。", reasoningSummary: "   " }));
+	await flush();
 	expect(summaryCalls()).toHaveLength(0);
 });
 
 test("does not repeat the popup for the same summary within one optimization", async () => {
-	// The same result must not stack two popups: a rerender or a duplicate
-	// notification path would otherwise show it twice.
-	let pending!: Promise<void>;
 	await act(async () => {
-		pending = result.handleOptimize("clarify");
+		await result.handleOptimize("clarify");
 	});
-	await act(async () => {
-		requests[0].resolve({ text: "写一个登录页面。", reasoningSummary: "补充校验。" });
-		await pending;
-	});
+	await act(async () =>
+		requests[0].resolve({ text: "写一个登录页面。", reasoningSummary: "补充校验。" }),
+	);
+	await flush();
 	expect(summaryCalls()).toHaveLength(1);
 });
 
 test("a cancelled optimization never shows the rationale", async () => {
-	let pending!: Promise<void>;
 	await act(async () => {
-		pending = result.handleOptimize("clarify");
+		await result.handleOptimize("clarify");
 	});
 	await act(async () => result.cancelOptimize());
-	await act(async () => {
-		requests[0].resolve({ text: "late", reasoningSummary: "should not appear" });
-		await pending;
-	});
+	await act(async () =>
+		requests[0].resolve({ text: "late", reasoningSummary: "should not appear" }),
+	);
+	await flush();
 	expect(summaryCalls()).toHaveLength(0);
 	expect(applied).toEqual([]);
+});
+
+/**
+ * Narrator attribution.
+ *
+ * A result belongs to the narrator that asked for it. Switching away must neither
+ * cancel that request nor let its text surface in the narrator now on screen.
+ */
+test("switching narrator keeps the original request running", async () => {
+	await act(async () => {
+		await result.handleOptimize("clarify");
+	});
+	// Same route, different narrator: the composer re-renders against a new id.
+	renderNarratorId = "other";
+	await act(async () => root.render(<Probe />));
+
+	// The other narrator sees no loading state of its own…
+	expect(result.loading).toBe(false);
+	// …and the first request was not cancelled.
+	expect(requests[0].signal.aborted).toBe(false);
+
+	// Its result must not be written into the narrator now on screen.
+	await act(async () => requests[0].resolve({ text: "属于第一个叙述者。" }));
+	await flush();
+	expect(applied).toEqual([]);
+});
+
+/**
+ * Coming back to a narrator whose optimization is still running must show that
+ * narrator as busy again — the composer is a fresh mount and must read the
+ * running task out of the registry rather than starting from `loading: false`.
+ */
+test("switching back to a still-running narrator restores its loading state", async () => {
+	await act(async () => {
+		await result.handleOptimize("clarify");
+	});
+	expect(result.loading).toBe(true);
+
+	// Away to another narrator…
+	renderNarratorId = "other";
+	await act(async () => root.render(<Probe />));
+	expect(result.loading).toBe(false);
+
+	// …and back to the one whose request is still in flight.
+	renderNarratorId = "n";
+	await act(async () => root.render(<Probe />));
+	expect(result.loading).toBe(true);
+});
+
+test("a narrator with no running task still reports idle after switching", async () => {
+	renderNarratorId = "other";
+	await act(async () => root.render(<Probe />));
+	expect(result.loading).toBe(false);
+});
+
+/**
+ * The real switch path: the composer is torn down and rebuilt for the narrator
+ * being shown, so the running state has to be re-read from the registry on mount
+ * rather than living in component state that starts at `loading: false`.
+ */
+test("remounting the composer of a running narrator restores loading", async () => {
+	await act(async () => {
+		await result.handleOptimize("clarify");
+	});
+	expect(result.loading).toBe(true);
+
+	// Leave the narrator entirely.
+	await act(async () => root.unmount());
+	expect(requests[0].signal.aborted).toBe(false);
+
+	// Come back to it: a brand-new mount reads the still-running task.
+	root = createRoot(document.body.appendChild(document.createElement("div")));
+	await act(async () => root.render(<Probe />));
+	expect(result.loading).toBe(true);
+});
+
+/**
+ * The acceptance path, with the request started by a DIFFERENT instance of the
+ * composer (which is what a narrator switch produces — the mount that started the
+ * work is gone, so the new mount holds no task of its own).
+ */
+test("a fresh composer adopts a running optimization started by another instance", async () => {
+	// Somebody else (the previous mount) started the narrator's optimization.
+	startPromptOptimizeTask({
+		narratorId: "n",
+		text: "original",
+		style: "clarify",
+		withContext: false,
+		request: () => new Promise(() => {}),
+	});
+	expect(isNarratorOptimizingPrompt("n")).toBe(true);
+
+	// A new mount for the same narrator must report the in-flight work, not idle.
+	await act(async () => root.render(<Probe />));
+	expect(result.loading).toBe(true);
+});
+
+test("adopting does not leak across narrators", async () => {
+	startPromptOptimizeTask({
+		narratorId: "other",
+		text: "x",
+		style: "clarify",
+		withContext: false,
+		request: () => new Promise(() => {}),
+	});
+	// Narrator "n" has nothing running, so its toolbar stays idle even though a
+	// different narrator is busy.
+	await act(async () => root.render(<Probe />));
+	expect(result.loading).toBe(false);
+});
+
+test("an inline message edit does not make the composer toolbar look busy", async () => {
+	// Message editors are a different draft; the composer must not claim their work
+	// (nor offer to cancel it from the wrong surface).
+	startPromptOptimizeTask({
+		narratorId: "n",
+		messageId: "m1",
+		text: "x",
+		style: "clarify",
+		withContext: false,
+		request: () => new Promise(() => {}),
+	});
+	await act(async () => root.render(<Probe />));
+	expect(result.loading).toBe(false);
+	// The narrator is still shown as busy in the sidebar — that indicator counts any
+	// optimization for the narrator.
+	expect(isNarratorOptimizingPrompt("n")).toBe(true);
 });
