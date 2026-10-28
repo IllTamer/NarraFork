@@ -29,6 +29,7 @@ import {
 } from "./provider-model-metadata";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
+import { unsupportedResponseFormatReason } from "./response-format";
 import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { ApiError, type ResolvedToolDefinition } from "./types";
@@ -346,7 +347,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.generateStreaming({
+		const result = await this.generateStreaming({
 			model,
 			systemInstruction,
 			userText: text,
@@ -356,6 +357,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
 		});
+		// The Interactions surface has no JSON-Schema output mode, so a requested
+		// responseFormat is reported as degraded rather than silently dropped.
+		if (!options?.responseFormat || result.responseFormatDegraded) return result;
+		return {
+			...result,
+			responseFormatDegraded: unsupportedResponseFormatReason("Gemini Interactions"),
+		};
 	}
 
 	async generateWithHistory(

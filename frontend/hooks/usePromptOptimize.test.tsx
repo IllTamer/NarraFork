@@ -15,7 +15,7 @@ let result: ReturnType<typeof usePromptOptimize>;
 let applied: string[];
 let requests: {
 	signal: AbortSignal;
-	resolve: (value: { text: string }) => void;
+	resolve: (value: { text: string; reasoningSummary?: string }) => void;
 	reject: (error: Error) => void;
 }[];
 const originals = new Map<string, PropertyDescriptor | undefined>();
@@ -121,4 +121,154 @@ test("unmount aborts and suppresses late text and notifications", async () => {
 	await pending;
 	expect(applied).toEqual([]);
 	expect(notifications.show).not.toHaveBeenCalled();
+});
+
+/**
+ * What actually lands in the composer.
+ *
+ * The hook writes the server's `text` verbatim, so the server is responsible for
+ * the payload being clean. These tests pin that the hook imposes no rewriting of
+ * its own and does not append anything to the returned text — a regression here
+ * would show up as thinking or framing leaking into the input box.
+ */
+test("writes the returned text verbatim and notifies success", async () => {
+	let pending!: Promise<void>;
+	await act(async () => {
+		pending = result.handleOptimize("clarify");
+	});
+	await act(async () => {
+		requests[0].resolve({ text: "写一个登录页面。" });
+		await pending;
+	});
+	expect(applied).toEqual(["写一个登录页面。"]);
+	expect(notifications.show).toHaveBeenCalledWith(
+		expect.objectContaining({ message: "optimizeSuccess", color: "green" }),
+	);
+	expect(result.loading).toBe(false);
+});
+
+test("preserves multi-segment markers in the returned text", async () => {
+	const optimized =
+		"<<<NF_seg_0>>>\n写一个登录页面\n<<<NF_seg_0_END>>>\n<<<NF_seg_1>>>\n补充校验\n<<<NF_seg_1_END>>>";
+	let pending!: Promise<void>;
+	await act(async () => {
+		pending = result.handleOptimize("structured");
+	});
+	await act(async () => {
+		requests[0].resolve({ text: optimized });
+		await pending;
+	});
+	// Markers are the client's rebuild keys: the hook must not trim or reflow them.
+	expect(applied).toEqual([optimized]);
+});
+
+test("surfaces a server-side failure instead of writing anything", async () => {
+	let pending!: Promise<void>;
+	await act(async () => {
+		pending = result.handleOptimize("clarify");
+	});
+	await act(async () => {
+		requests[0].reject(new Error("context too long: no context available"));
+		await pending;
+	});
+	expect(applied).toEqual([]);
+	expect(notifications.show).toHaveBeenCalledWith(
+		expect.objectContaining({ message: "optimizeNoContext", color: "red" }),
+	);
+	expect(result.loading).toBe(false);
+});
+
+/**
+ * The rationale popup.
+ *
+ * The summary is presentation only — it must never be written into the composer,
+ * and an absent or blank one must not raise a popup at all.
+ */
+function summaryCalls() {
+	return (notifications.show as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter(
+		(call) => (call[0] as { title?: string }).title === "optimizeSummaryTitle",
+	);
+}
+
+test("shows the rationale once when the server returns a summary", async () => {
+	let pending!: Promise<void>;
+	await act(async () => {
+		pending = result.handleOptimize("clarify");
+	});
+	await act(async () => {
+		requests[0].resolve({
+			text: "写一个登录页面。",
+			reasoningSummary: "补充了字段与校验要求。",
+		});
+		await pending;
+	});
+	const calls = summaryCalls();
+	expect(calls).toHaveLength(1);
+	expect(calls[0][0]).toEqual(
+		expect.objectContaining({
+			title: "optimizeSummaryTitle",
+			message: "补充了字段与校验要求。",
+			// Manually dismissable, and it goes away on its own.
+			withCloseButton: true,
+			autoClose: expect.any(Number),
+		}),
+	);
+	// The summary is shown beside the result, never written into the prompt.
+	expect(applied).toEqual(["写一个登录页面。"]);
+});
+
+test("does not show a popup when the summary is missing", async () => {
+	let pending!: Promise<void>;
+	await act(async () => {
+		pending = result.handleOptimize("clarify");
+	});
+	await act(async () => {
+		requests[0].resolve({ text: "写一个登录页面。" });
+		await pending;
+	});
+	expect(summaryCalls()).toHaveLength(0);
+	// The success notification still fires.
+	expect(notifications.show).toHaveBeenCalledWith(
+		expect.objectContaining({ message: "optimizeSuccess" }),
+	);
+});
+
+test("does not show a popup when the summary is blank", async () => {
+	let pending!: Promise<void>;
+	await act(async () => {
+		pending = result.handleOptimize("clarify");
+	});
+	await act(async () => {
+		requests[0].resolve({ text: "写一个登录页面。", reasoningSummary: "   " });
+		await pending;
+	});
+	expect(summaryCalls()).toHaveLength(0);
+});
+
+test("does not repeat the popup for the same summary within one optimization", async () => {
+	// The same result must not stack two popups: a rerender or a duplicate
+	// notification path would otherwise show it twice.
+	let pending!: Promise<void>;
+	await act(async () => {
+		pending = result.handleOptimize("clarify");
+	});
+	await act(async () => {
+		requests[0].resolve({ text: "写一个登录页面。", reasoningSummary: "补充校验。" });
+		await pending;
+	});
+	expect(summaryCalls()).toHaveLength(1);
+});
+
+test("a cancelled optimization never shows the rationale", async () => {
+	let pending!: Promise<void>;
+	await act(async () => {
+		pending = result.handleOptimize("clarify");
+	});
+	await act(async () => result.cancelOptimize());
+	await act(async () => {
+		requests[0].resolve({ text: "late", reasoningSummary: "should not appear" });
+		await pending;
+	});
+	expect(summaryCalls()).toHaveLength(0);
+	expect(applied).toEqual([]);
 });

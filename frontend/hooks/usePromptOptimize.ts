@@ -54,6 +54,11 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 		}
 	});
 	const abortRef = useRef<AbortController | null>(null);
+	/**
+	 * Last rationale surfaced, so a repeated identical summary does not raise a
+	 * second popup for what the user already read. Reset per optimization request.
+	 */
+	const shownSummaryRef = useRef<string | null>(null);
 	const cancelOptimize = useCallback(() => {
 		abortRef.current?.abort();
 		abortRef.current = null;
@@ -89,6 +94,9 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 			}
 			const controller = new AbortController();
 			abortRef.current = controller;
+			// A new request may legitimately produce the same summary text again;
+			// dedupe is per-request, not global.
+			shownSummaryRef.current = null;
 			setLoading(true);
 
 			try {
@@ -116,6 +124,21 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 					color: "green",
 					autoClose: 8000,
 				});
+
+				// Presentation only: the rationale is shown beside the result and never
+				// enters the composer. Guarded so one optimization raises one popup even
+				// if the same summary comes back twice.
+				const summary = result.reasoningSummary?.trim();
+				if (summary && shownSummaryRef.current !== summary) {
+					shownSummaryRef.current = summary;
+					notifications.show({
+						title: t("optimizeSummaryTitle"),
+						message: summary,
+						color: "indigo",
+						autoClose: 12000,
+						withCloseButton: true,
+					});
+				}
 			} catch (err) {
 				if (
 					controller.signal.aborted ||

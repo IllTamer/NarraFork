@@ -53,6 +53,7 @@ import {
 import { summaryGenerate } from "../lib/agent";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { generateWithFirstTokenTimeout } from "../lib/agent/generate-first-token-timeout";
+import type { ResponseFormat } from "../lib/agent/provider";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
@@ -149,9 +150,14 @@ import {
 	selectActionableDependencies,
 } from "../lib/prompt-i18n";
 import {
+	getOptimizeOutputSchema,
 	getPromptOptimizeInstruction,
+	OPTIMIZE_OUTPUT_SCHEMA_NAME,
+	OPTIMIZE_SUMMARY_FIELD,
 	type PromptOptimizeStyle,
+	readOptimizeResult,
 } from "../lib/prompts/prompt-optimize";
+import { normalizeOptimizedPrompt } from "../lib/prompts/prompt-optimize-output";
 import { saveRequestRecording } from "../lib/request-recorder";
 import { policySourceIdOf } from "../lib/runtime-source";
 import {
@@ -1890,6 +1896,19 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	// Resolve the model (default follows summaryModel via __summary__)
 	const model = resolveEffectiveModel(settings.agent.promptOptimizeModel);
 
+	// Ask for the optimized text as a schema-constrained object when the resolved
+	// adapter can express one. `responseFormatDegraded` reports adapters that
+	// cannot (they must not silently ignore it), and the text path below is then
+	// the only source of truth.
+	const responseFormat: ResponseFormat = {
+		type: "json_schema",
+		name: OPTIMIZE_OUTPUT_SCHEMA_NAME,
+		schema: getOptimizeOutputSchema(),
+		strict: true,
+		// Lets the provider layer lift the rationale without knowing field names.
+		summaryField: OPTIMIZE_SUMMARY_FIELD,
+	};
+
 	// Follow the configured first-token budget; output clears the timer. Request
 	// cancellation remains connected to the provider throughout generation.
 	const generated = await generateWithFirstTokenTimeout(
@@ -1904,6 +1923,9 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 				undefined,
 				false,
 				options.onReasoningDelta,
+				undefined,
+				undefined,
+				{ responseFormat },
 			),
 		settings.agent.firstTokenTimeoutMs,
 		c.req.raw.signal,
@@ -1913,31 +1935,28 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 		}
 		throw err;
 	});
-	let result = generated.text;
 
-	// Post-process: trim, remove wrapping quotes/code fences
-	result = result.trim();
-	// Remove wrapping quotes
-	if (
-		(result.startsWith('"') && result.endsWith('"')) ||
-		(result.startsWith("'") && result.endsWith("'"))
-	) {
-		result = result.slice(1, -1).trim();
-	}
-	// Remove code fences
-	if (result.startsWith("```") && result.endsWith("```")) {
-		const lines = result.split("\n");
-		if (lines.length > 2) {
-			result = lines.slice(1, -1).join("\n").trim();
-		}
+	if (generated.responseFormatDegraded) {
+		// Not an error: the fallback path below still produces a usable prompt, but
+		// structure was not honoured, so no reasoning summary can be reported. Warn
+		// rather than debug — this is the difference the user sees as "no summary
+		// popup", and it must be findable in the log when it happens.
+		logger.warn("Prompt optimize fell back to text parsing", {
+			narratorId,
+			model,
+			reason: generated.responseFormatDegraded,
+		});
 	}
 
-	// Fallback to original if result is empty
-	if (!result) {
-		result = text;
-	}
+	// Structured first (whitelisted fields only), text second. Both go through the
+	// same normalizer so the two paths cannot produce differently packaged output.
+	// The summary never enters the text path: it is presentation only.
+	const structured = readOptimizeResult(generated.structured);
+	const result = normalizeOptimizedPrompt(structured?.optimizedPrompt ?? generated.text, text);
+	// A degraded response must not claim a summary — the text path cannot know one.
+	const reasoningSummary = structured?.reasoningSummary ?? generated.reasoningSummary;
 
-	return c.json({ text: result, model });
+	return c.json({ text: result, model, ...(reasoningSummary ? { reasoningSummary } : {}) });
 });
 
 // Get usage stats for this narrator, optionally including direct subagents.

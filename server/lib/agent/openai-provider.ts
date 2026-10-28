@@ -61,6 +61,17 @@ import {
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { parseJsonTextWithBody } from "./response-body";
+import {
+	openAIChatResponseFormat,
+	openAIResponsesTextFormat,
+	structuredResult,
+} from "./response-format";
+import {
+	modelLacksNativeStructuredOutput,
+	rememberMissingNativeStructuredOutput,
+	structuredOutputRelayKey,
+	withSchemaInstruction,
+} from "./structured-output-fallback";
 import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import type { ToolLoadingChange, ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -1030,6 +1041,25 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		const bareModel = parseModelId(model).model;
 
+		// Native structured output first. A relay that has already proven it
+		// ignores the constraint is downgraded to restating the schema in the
+		// instruction instead — the fields are still recoverable, but the strict
+		// guarantee is gone.
+		const relayKey = structuredOutputRelayKey(this.apiMode, model);
+		const useNativeFormat =
+			!!options?.responseFormat && !modelLacksNativeStructuredOutput(relayKey);
+		const instruction =
+			options?.responseFormat && !useNativeFormat
+				? withSchemaInstruction(systemInstruction, options.responseFormat)
+				: systemInstruction;
+		/** Learn from a native attempt that came back without structure. */
+		const learnFrom = (result: GenerateMetaResult): GenerateMetaResult => {
+			if (useNativeFormat && result.responseFormatDegraded) {
+				rememberMissingNativeStructuredOutput(relayKey);
+			}
+			return result;
+		};
+
 		if (usesResponsesEndpoint(this.apiMode)) {
 			const body: Record<string, unknown> = {
 				model: bareModel,
@@ -1037,8 +1067,8 @@ export class OpenAIProvider implements ProviderAdapter {
 				store: false,
 			};
 			const codexIdentity = this.apiMode === "codex" ? createCodexRequestIdentity() : undefined;
-			if (systemInstruction) {
-				body.instructions = systemInstruction;
+			if (instruction) {
+				body.instructions = instruction;
 			} else if (this.apiMode === "codex") {
 				// Codex gateway requires non-empty instructions on /responses.
 				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
@@ -1054,12 +1084,23 @@ export class OpenAIProvider implements ProviderAdapter {
 				applyGenerateReasoningOptions(body, this.apiMode, model, options);
 			}
 			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
+			// The Responses API carries the output constraint as `text.format`,
+			// not `response_format`. Merge rather than assign so a future
+			// `text.verbosity` survives.
+			if (useNativeFormat && options?.responseFormat) {
+				body.text = {
+					...(body.text && typeof body.text === "object"
+						? (body.text as Record<string, unknown>)
+						: {}),
+					...openAIResponsesTextFormat(options.responseFormat),
+				};
+			}
 			const conversationId = codexIdentity?.conversationId;
 			// Per-turn x-codex-turn-state slot: the fallback retry below is a later
 			// request of the SAME turn and must replay the token the first
 			// response handed back (codex-rs sends it as an HTTP header here).
 			const turnState: { value: string | null } = { value: null };
-			return withUnsupportedParameterFallback(model, body, (retryBody) =>
+			const result = await withUnsupportedParameterFallback(model, body, (retryBody) =>
 				this.requestResponsesTextWithMeta(
 					baseUrl,
 					apiKey,
@@ -1070,12 +1111,13 @@ export class OpenAIProvider implements ProviderAdapter {
 					turnState,
 				),
 			);
+			return learnFrom(result);
 		}
 
 		// Completions: POST /chat/completions
 		const messages: Array<{ role: "system" | "user"; content: string }> = [];
-		if (systemInstruction) {
-			messages.push({ role: "system", content: systemInstruction });
+		if (instruction) {
+			messages.push({ role: "system", content: instruction });
 		}
 		messages.push({ role: "user", content: text });
 		const body: Record<string, unknown> = {
@@ -1086,9 +1128,13 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		applyGenerateReasoningOptions(body, this.apiMode, model, options);
 		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
-		return withUnsupportedParameterFallback(model, body, (retryBody) =>
+		if (useNativeFormat && options?.responseFormat) {
+			body.response_format = openAIChatResponseFormat(options.responseFormat);
+		}
+		const result = await withUnsupportedParameterFallback(model, body, (retryBody) =>
 			this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, retryBody, options?.signal, options),
 		);
+		return learnFrom(result);
 	}
 
 	async generateWithHistory(
@@ -1232,6 +1278,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				text,
 				...(outputTruncated && { outputTruncated }),
 				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
+				...structuredResult(options, text, "OpenAI Responses"),
 			};
 		}
 
@@ -1261,7 +1308,12 @@ export class OpenAIProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, usage, ...(outputTruncated && { outputTruncated }) };
+		return {
+			text,
+			usage,
+			...(outputTruncated && { outputTruncated }),
+			...structuredResult(options, text, "OpenAI Responses"),
+		};
 	}
 
 	private async requestChatCompletionsTextWithMeta(
@@ -1322,6 +1374,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				...(outputTruncated && { outputTruncated }),
 				contextPercent: undefined,
 				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
+				...structuredResult(options, text, "OpenAI Chat Completions"),
 			};
 		}
 
@@ -1351,7 +1404,13 @@ export class OpenAIProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, contextPercent: undefined, usage, ...(outputTruncated && { outputTruncated }) };
+		return {
+			text,
+			contextPercent: undefined,
+			usage,
+			...(outputTruncated && { outputTruncated }),
+			...structuredResult(options, text, "OpenAI Chat Completions"),
+		};
 	}
 
 	/**

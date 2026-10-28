@@ -460,6 +460,15 @@ export async function summaryGenerate(
 	onReasoningDelta?: GenerateOptions["onReasoningDelta"],
 	onRetryProgress?: () => void,
 	onRetryScheduled?: (info: SummaryRetryInfo) => void,
+	/**
+	 * Extra {@link GenerateOptions} layered on top of the fixed summary options.
+	 * A trailing bag rather than another positional flag: this signature is
+	 * already deep, and callers that need one more capability should not have to
+	 * re-count parameters. Only additive options belong here — `signal` and the
+	 * delta callbacks keep their dedicated slots so retries and progress stay
+	 * connected to the caller's request.
+	 */
+	extraOptions?: Partial<Pick<GenerateOptions, "responseFormat">>,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	// Retries belong to the original invocation, even if the caller reuses its options.
@@ -470,6 +479,9 @@ export async function summaryGenerate(
 		...(onTextDelta ? { onTextDelta } : {}),
 		...(onReasoningDelta ? { onReasoningDelta } : {}),
 		...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+		// Last, so an explicit per-call constraint is never shadowed by the
+		// fixed auxiliary defaults above.
+		...extraOptions,
 	};
 	return withSummaryRetry(
 		() => agentGenerateWithMeta(text, model, systemInstruction, generateOptions, requestTracking),
