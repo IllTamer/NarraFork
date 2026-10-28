@@ -4863,7 +4863,12 @@ async function* agentLoopInMetadataSnapshot(
 						resetUpstreamSession,
 						onRequestStart: (info) => {
 							if (!config.reflectionLoop) {
-								rememberModelTraceRequest(config.narratorId, provider, requestParams);
+								rememberModelTraceRequest(
+									config.narratorId,
+									provider,
+									requestParams,
+									effectiveProvider,
+								);
 							}
 							markRequestStarted(info);
 						},
