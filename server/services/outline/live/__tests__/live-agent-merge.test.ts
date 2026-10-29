@@ -10,6 +10,8 @@
  *   - The same with keystrokes still on their way when the agent writes.
  *   - The agent's change overlaps what the person typed: the call writes nothing and the person's
  *     text stays, live and committed.
+ *   - The agent deletes a block while the person types in a block under it: refused, nothing
+ *     deleted, the typing stays.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; each test makes its own page.
  */
@@ -308,5 +310,44 @@ describe("an agent writing into a page being typed in", () => {
 		type(a, block.id, "!");
 		await settle();
 		expect(b.textOf(block.id)).toBe(`${typed}!`);
+	});
+
+	test("a delete of a block whose child is being typed in writes nothing; the typing stays", async () => {
+		const r = await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{ op: "insert", tempId: "p", parent: null, content: "Page" },
+				{ op: "insert", tempId: "s", parent: { tempId: "p" }, content: "Section" },
+				{ op: "insert", tempId: "d", parent: { tempId: "s" }, content: "detail" },
+			],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const [p, section, detail] = r.results as Array<{ blockId: string; sid: string }>;
+		if (!p || !section || !detail) throw new Error("no blocks");
+		await outlineReadTool.execute({ address: p.sid }, agent());
+		const alice = open(owner);
+		const a = alice.page(p.blockId);
+		await waitFor(() => a.ready, 3000, "joined");
+		await settle();
+		type(a, detail.blockId, ", being worked out");
+		await settle();
+		expect(liveSessionOf(p.blockId)?.hasUnflushed).toBe(true);
+
+		const result = await edit([{ delete: section.sid }]);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain(`[${detail.sid}] was changed by a person`);
+		expect(result.output).toContain(`it is under [${section.sid}], which you are deleting with it`);
+		expect(result.output).toContain(`- [${detail.sid}] detail, being worked out`);
+		await settle(40);
+		expect(await everywhere([a], p.blockId, detail.blockId)).toEqual({
+			clients: ["detail, being worked out"],
+			session: "detail, being worked out",
+			stored: "detail, being worked out",
+		});
+		expect((await outlineStore.getBlock(section.blockId))?.deleted).toBe(false);
+		type(a, detail.blockId, "!");
+		await settle();
+		expect(a.textOf(detail.blockId)).toBe("detail, being worked out!");
 	});
 });

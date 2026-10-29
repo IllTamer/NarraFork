@@ -19,10 +19,15 @@
  *      a `replace` (`agent-merge.ts`: the agent's change from the version it read, applied to
  *      the block as it is now; text changes that do not overlap and fields only one side
  *      changed). Anything else is a conflict: an overlap, a field both changed, or a move,
- *      delete or set of such a block. One conflict refuses the whole call, reported with each
- *      conflicting block's current text and where it conflicts; nothing is written. This and the
- *      write run behind the live session barrier (`live-barrier.ts`), so edits still in a
- *      page's live session count as changes: they are committed first and merged with.
+ *      delete or set of such a block. Two more refuse a call: a replace or delete of a block the
+ *      agent has not read (the ledger lives in memory: nothing is read after a restart) whose
+ *      latest version someone else wrote; and a delete of a block with live descendants someone
+ *      else wrote since the agent read them (or that it never read), or with more of them than
+ *      are checked. Those blocks are shown in full and then count as read, so the same edit goes
+ *      through once the agent has seen them. One conflict refuses the whole call, reported with
+ *      each conflicting block's current text and where it conflicts; nothing is written. This
+ *      and the write run behind the live session barrier (`live-barrier.ts`), so edits still in
+ *      a page's live session count as changes: they are committed first and merged with.
  *   5. Write one transaction with provenance (this narrator as actor, the turn's person as
  *      responsible, the message and tool call), content handed over already normalized. Merged
  *      blocks are ordinary updates marked `merged` (`OUTLINE_CHANGE.MERGE` on their versions),
@@ -65,7 +70,14 @@ import { OUTLINE_TOOL_TEXT } from "./messages";
 import { OUTLINE_LIMITS } from "./model";
 import { forgetOutlineReads, recordOutlineReads, seenOutlineVersion } from "./read-ledger";
 import type { OutlineResolvedBlock } from "./resolve";
-import type { OutlineBlockRow, OutlineCommitRow, OutlineSpaceRow } from "./store/port";
+import type {
+	OutlineBlockMeta,
+	OutlineBlockRow,
+	OutlineCommitRow,
+	OutlineSpaceRow,
+	OutlineStore,
+} from "./store/port";
+import type { OutlineNode } from "./tree";
 import {
 	type OutlineBlockRef,
 	type OutlineCanonicalContent,
@@ -122,6 +134,12 @@ export const OUTLINE_EDIT_LIMITS = {
 	maxConflictChars: 400,
 	/** UTF-8 bytes of merged blocks' text a result shows; the rest are named only. */
 	maxMergedBytes: 32 * 1024,
+	/** Blocks under the blocks one call deletes that are checked for changes; more refuse it. */
+	maxDeletedChecked: OUTLINE_LIMITS.maxRowsTouched,
+	/** Conflicting blocks a result lists; the rest are counted. */
+	maxConflictsListed: 50,
+	/** UTF-8 bytes of conflicting blocks' current text a result shows in full (see below). */
+	maxConflictShownBytes: 32 * 1024,
 } as const;
 
 const STATUS_OF: Record<Exclude<OutlineCheckbox, "none">, OutlineTaskInput["status"]> = {
@@ -683,58 +701,104 @@ export async function outlineEdit(
 			const current = new Map(
 				(await scope.store.getBlockMetas(space.id, { ids: existingIds })).map((m) => [m.id, m]),
 			);
-			const stale = [...current.values()].filter((m) => {
-				const seen = seenOutlineVersion(scope.narratorId, m.id);
-				return seen !== undefined && m.versionSeq > seen;
+			const seenOf = (blockId: string) => seenOutlineVersion(scope.narratorId, blockId);
+			const editsOf = new Map<string, EditState[]>();
+			for (const edit of edits) {
+				if (edit.located?.kind !== "block") continue;
+				const id = edit.located.block.id;
+				editsOf.set(id, [...(editsOf.get(id) ?? []), edit]);
+			}
+			// What a delete takes with it: its live descendants, which the agent may not have read.
+			const deleted = [...editsOf.entries()]
+				.filter(([, list]) => list.some((e) => e.kind === "delete"))
+				.map(([id]) => id);
+			const under = await liveDescendants(
+				scope.store,
+				space.id,
+				deleted,
+				OUTLINE_EDIT_LIMITS.maxDeletedChecked,
+			);
+			// Blocks someone may have written since the agent read them (or never read).
+			const unsure = (m: OutlineBlockMeta) => {
+				const seen = seenOf(m.id);
+				return seen === undefined || m.versionSeq > seen;
+			};
+			const suspects = [...current.values(), ...under.blocks.map((b) => b.meta)].filter(unsure);
+			const commits = new Map(
+				suspects.length === 0
+					? []
+					: (
+							await scope.store.getCommitsBySeqs(space.id, [
+								...new Set(suspects.map((m) => m.versionSeq)),
+							])
+						).map((c) => [c.seq, c]),
+			);
+			const byOther = (m: OutlineBlockMeta) => {
+				const commit = commits.get(m.versionSeq);
+				return !(commit?.actorKind === "agent" && commit.actorId === scope.narratorId);
+			};
+			const why = (
+				m: OutlineBlockMeta,
+				extra: Partial<ChangedSinceRead> = {},
+			): ChangedSinceRead => ({
+				blockId: m.id,
+				sid: m.sid,
+				seen: seenOf(m.id) ?? null,
+				now: m.versionSeq,
+				by: commits.get(m.versionSeq),
+				...extra,
 			});
+			const changed = [...current.values()]
+				.filter((m) => seenOf(m.id) !== undefined && unsure(m) && byOther(m))
+				.map((m) => why(m));
+			// Only a block's one replace is merged; a move, delete or set needs the block as read.
+			const replaceOf = (blockId: string) => {
+				const list = editsOf.get(blockId) ?? [];
+				return list.length === 1 && list[0]?.kind === "replace" ? list[0] : undefined;
+			};
+			// Never read (or not since the server started): a replace or delete of what someone
+			// else wrote needs a read first (design §6.5, the read cache gone: any change refuses).
+			const rewrites = (blockId: string) =>
+				(editsOf.get(blockId) ?? []).some((e) => e.kind === "replace" || e.kind === "delete");
+			const unread = [...current.values()]
+				.filter((m) => seenOf(m.id) === undefined && byOther(m) && rewrites(m.id))
+				.map((m) => why(m, { shown: true }));
+			const sidOf = (id: string) => current.get(id)?.sid ?? id;
+			const underChanged = under.blocks
+				.filter((b) => unsure(b.meta) && byOther(b.meta))
+				.map((b) => why(b.meta, { under: sidOf(b.rootId), shown: true }));
+			const tooLarge = under.overflow.flatMap((id) => {
+				const m = current.get(id);
+				return m ? [why(m, { tooLarge: true })] : [];
+			});
+			// Each block once (one deleted under another is both a target and under it).
+			const refusedNow = new Map<string, ChangedSinceRead>();
+			for (const c of [
+				...changed
+					.filter((c) => !replaceOf(c.blockId))
+					.map((c) => ({ ...c, detail: [OUTLINE_TOOL_TEXT.edit.notMerged] })),
+				...unread,
+				...tooLarge,
+				...underChanged,
+			]) {
+				if (!refusedNow.has(c.blockId)) refusedNow.set(c.blockId, c);
+			}
+			if (refusedNow.size > 0) return { conflicts: [...refusedNow.values()] };
+
 			/** Blocks to merge, with who changed them since the agent read them. */
 			const merges = new Map<
 				string,
 				{ merge: Extract<AgentMerge, { ok: true }>; why: ChangedSinceRead }
 			>();
-			if (stale.length > 0) {
-				const commits = new Map(
-					(
-						await scope.store.getCommitsBySeqs(space.id, [
-							...new Set(stale.map((m) => m.versionSeq)),
-						])
-					).map((c) => [c.seq, c]),
-				);
-				const changed: ChangedSinceRead[] = stale
-					.filter((m) => {
-						const commit = commits.get(m.versionSeq);
-						return !(commit?.actorKind === "agent" && commit.actorId === scope.narratorId);
-					})
-					.map((m) => ({
-						blockId: m.id,
-						sid: m.sid,
-						seen: seenOutlineVersion(scope.narratorId, m.id) as number,
-						now: m.versionSeq,
-						by: commits.get(m.versionSeq),
-					}));
-				// Only a block's one replace is merged; a move, delete or set needs the block as read.
-				const editsOf = new Map<string, EditState[]>();
-				for (const edit of edits) {
-					if (edit.located?.kind !== "block") continue;
-					const id = edit.located.block.id;
-					editsOf.set(id, [...(editsOf.get(id) ?? []), edit]);
-				}
-				const replaceOf = (blockId: string) => {
-					const list = editsOf.get(blockId) ?? [];
-					return list.length === 1 && list[0]?.kind === "replace" ? list[0] : undefined;
-				};
-				const unmergeable = changed.filter((c) => !replaceOf(c.blockId));
-				if (unmergeable.length > 0) {
-					return {
-						conflicts: unmergeable.map((c) => ({
-							...c,
-							detail: [OUTLINE_TOOL_TEXT.edit.notMerged],
-						})),
-					};
-				}
+			if (changed.length > 0) {
 				const replaces: AgentReplace[] = changed.map((c) => {
 					const p = (replaceOf(c.blockId)?.items as PlannedItem[])[0] as PlannedItem;
-					return { blockId: c.blockId, seen: c.seen, content: p.content, ...replaceFields(p) };
+					return {
+						blockId: c.blockId,
+						seen: c.seen as number,
+						content: p.content,
+						...replaceFields(p),
+					};
 				});
 				let results: AgentMerge[];
 				try {
@@ -747,9 +811,9 @@ export async function outlineEdit(
 				}
 				const refused: ChangedSinceRead[] = [];
 				results.forEach((r, i) => {
-					const why = changed[i] as ChangedSinceRead;
-					if (r.ok) merges.set(r.blockId, { merge: r, why });
-					else refused.push({ ...why, detail: refusalDetail(r) });
+					const c = changed[i] as ChangedSinceRead;
+					if (r.ok) merges.set(r.blockId, { merge: r, why: c });
+					else refused.push({ ...c, detail: refusalDetail(r) });
 				});
 				if (refused.length > 0) return { conflicts: refused };
 			}
@@ -948,23 +1012,11 @@ export async function outlineEdit(
 			if (merges.size > 0) {
 				const ids = [...merges.keys()];
 				const rows = await scope.store.getBlocks(ids);
-				const tags = await scope.store.listLinksAt(
-					ids,
-					null,
-					["tag"],
-					ids.length * OUTLINE_LIMITS.maxTagsPerBlock,
-				);
+				const tags = await tagsNow(scope, ids);
 				for (const row of rows) {
 					const why = merges.get(row.id)?.why;
 					if (!why || row.deleted) continue;
-					merged.push({
-						why,
-						row,
-						tags: tags
-							.filter((t) => t.fromBlockId === row.id)
-							.map((t) => t.targetRef)
-							.sort(),
-					});
+					merged.push({ why, row, tags: tags.get(row.id) ?? [] });
 				}
 				recordOutlineReads(
 					scope.narratorId,
@@ -1024,13 +1076,86 @@ export async function outlineEdit(
 interface ChangedSinceRead {
 	blockId: string;
 	sid: string;
-	/** The version the agent read. */
-	seen: number;
+	/** The version the agent read; null when it has not read the block (or not since a restart). */
+	seen: number | null;
 	/** The block's version now. */
 	now: number;
 	by?: Pick<OutlineCommitRow, "actorKind" | "actorId">;
 	/** Why it could not be merged. */
 	detail?: string[];
+	/** The sid of the block this call deletes that it is under. */
+	under?: string;
+	/** A block this call deletes with more blocks under it than are checked. */
+	tooLarge?: boolean;
+	/**
+	 * Its current text is shown in full (within a budget) and then counts as read, so the edit
+	 * goes through once the agent has seen it: a block never read, or under a deleted one.
+	 */
+	shown?: boolean;
+}
+
+/**
+ * Live descendants of `rootIds`, breadth first, each with the root it is under, at most `max`:
+ * one indexed, bounded query per level. Roots whose subtree does not fit are `overflow` (with
+ * every root not reached).
+ */
+async function liveDescendants(
+	store: OutlineStore,
+	spaceId: string,
+	rootIds: readonly string[],
+	max: number,
+): Promise<{ blocks: Array<{ meta: OutlineBlockMeta; rootId: string }>; overflow: string[] }> {
+	const blocks: Array<{ meta: OutlineBlockMeta; rootId: string }> = [];
+	const overflow: string[] = [];
+	for (const [k, rootId] of rootIds.entries()) {
+		let frontier = [rootId];
+		while (frontier.length > 0) {
+			const remaining = max - blocks.length;
+			const rows = await store.listChildMetas(spaceId, frontier, remaining + 1);
+			if (rows.length > remaining) {
+				overflow.push(...rootIds.slice(k));
+				return { blocks, overflow };
+			}
+			for (const meta of rows) blocks.push({ meta, rootId });
+			frontier = rows.map((m) => m.id);
+		}
+	}
+	return { blocks, overflow };
+}
+
+/** A block row as a read's tree node (no parent or children), for showing it as a read does. */
+function rowNode(row: OutlineBlockRow, tags: string[]): OutlineNode {
+	return {
+		id: row.id,
+		sid: row.sid,
+		parentId: row.parentId,
+		orderKey: row.orderKey,
+		alias: row.alias,
+		task: row.taskJson,
+		versionSeq: row.versionSeq,
+		parent: null,
+		children: [],
+		content: row.content,
+		tags,
+	};
+}
+
+/** Tag targets of blocks now, sorted, by block. */
+async function tagsNow(
+	scope: OutlineAgentScope,
+	ids: readonly string[],
+): Promise<Map<string, string[]>> {
+	const out = new Map<string, string[]>(ids.map((id) => [id, []]));
+	if (ids.length === 0) return out;
+	const links = await scope.store.listLinksAt(
+		ids,
+		null,
+		["tag"],
+		ids.length * OUTLINE_LIMITS.maxTagsPerBlock,
+	);
+	for (const link of links) out.get(link.fromBlockId)?.push(link.targetRef);
+	for (const list of out.values()) list.sort();
+	return out;
 }
 
 /** What a result says about the blocks a call merged. */
@@ -1079,20 +1204,68 @@ async function conflictOutput(
 	conflicts: ChangedSinceRead[],
 	meta: Record<string, unknown>,
 ): Promise<OutlineToolOutput> {
+	const text = OUTLINE_TOOL_TEXT.edit;
+	const listed = conflicts.slice(0, OUTLINE_EDIT_LIMITS.maxConflictsListed);
 	const blocks = new Map(
-		(await scope.store.getBlocks(conflicts.map((c) => c.blockId))).map((b) => [b.id, b]),
+		(await scope.store.getBlocks(listed.map((c) => c.blockId))).map((b) => [b.id, b]),
 	);
-	const lines: string[] = [OUTLINE_TOOL_TEXT.edit.conflictHeader];
-	for (const c of conflicts) {
-		lines.push(`- ${OUTLINE_TOOL_TEXT.edit.conflict(c.sid, whoChanged(c.by), c.now, c.seen)}`);
+	// Blocks never read, or under a deleted block: shown in full as a read shows them, within a
+	// budget; those shown count as read from now on.
+	const full = listed.flatMap((c) => {
+		const row = blocks.get(c.blockId);
+		return c.shown && row && !row.deleted ? [row] : [];
+	});
+	const tags = await tagsNow(
+		scope,
+		full.map((row) => row.id),
+	);
+	const rendered = await blockLinesForAgent(
+		scope,
+		full.map((row) => rowNode(row, tags.get(row.id) ?? [])),
+	);
+	const shown: OutlineBlockRow[] = [];
+	let bytes = 0;
+	for (const row of full) {
+		const size = Buffer.byteLength(rendered.get(row.id) ?? "", "utf8");
+		if (bytes > 0 && bytes + size > OUTLINE_EDIT_LIMITS.maxConflictShownBytes) continue;
+		bytes += size;
+		shown.push(row);
+	}
+	const shownIds = new Set(shown.map((row) => row.id));
+
+	const lines: string[] = [text.conflictHeader];
+	let needsRead = conflicts.length > listed.length;
+	for (const c of listed) {
+		const who = whoChanged(c.by);
+		if (c.tooLarge) {
+			lines.push(`- ${text.tooLargeToDelete(c.sid, OUTLINE_EDIT_LIMITS.maxDeletedChecked)}`);
+			continue;
+		}
+		lines.push(
+			`- ${c.seen === null ? text.notRead(c.sid, who, c.now) : text.conflict(c.sid, who, c.now, c.seen)}`,
+		);
+		if (c.under) lines.push(`  ${text.underDeleted(c.under)}`);
 		for (const detail of c.detail ?? []) lines.push(`  ${detail}`);
 		const block = blocks.get(c.blockId);
-		if (block && !block.deleted) {
-			const text = clip(block.content.split("\n").join(" "), OUTLINE_EDIT_LIMITS.maxConflictChars);
-			lines.push(`  ${OUTLINE_TOOL_TEXT.edit.nowReads(text)}`);
-		} else if (block?.deleted) lines.push(`  ${OUTLINE_TOOL_TEXT.edit.nowDeleted}`);
+		if (shownIds.has(c.blockId)) lines.push(`  ${text.shownBelow}`);
+		else if (block && !block.deleted) {
+			needsRead = true;
+			const now = clip(block.content.split("\n").join(" "), OUTLINE_EDIT_LIMITS.maxConflictChars);
+			lines.push(`  ${text.nowReads(now)}`);
+		} else if (block?.deleted) lines.push(`  ${text.nowDeleted}`);
 	}
-	lines.push(OUTLINE_TOOL_TEXT.edit.conflictRecover(space.key));
+	if (conflicts.length > listed.length)
+		lines.push(text.moreConflicts(conflicts.length - listed.length));
+	if (conflicts.some((c) => c.seen === null && !c.tooLarge)) lines.push(text.readFirst);
+	if (shown.length > 0) {
+		lines.push(text.shownHeader);
+		for (const row of shown) lines.push(rendered.get(row.id) ?? "");
+		recordOutlineReads(
+			scope.narratorId,
+			shown.map((row) => [row.id, row.versionSeq] as const),
+		);
+	}
+	if (needsRead || shown.length === 0) lines.push(text.conflictRecover(space.key));
 	return {
 		output: lines.join("\n"),
 		isError: true,
@@ -1122,19 +1295,7 @@ async function mergedSection(
 	if (merged.length === 0) return { lines: [], sids: new Set() };
 	const rendered = await blockLinesForAgent(
 		scope,
-		merged.map((m) => ({
-			id: m.row.id,
-			sid: m.row.sid,
-			parentId: m.row.parentId,
-			orderKey: m.row.orderKey,
-			alias: m.row.alias,
-			task: m.row.taskJson,
-			versionSeq: m.row.versionSeq,
-			parent: null,
-			children: [],
-			content: m.row.content,
-			tags: m.tags,
-		})),
+		merged.map((m) => rowNode(m.row, m.tags)),
 	);
 	const lines: string[] = [OUTLINE_TOOL_TEXT.edit.mergedHeader];
 	const unshown: string[] = [];
@@ -1149,7 +1310,7 @@ async function mergedSection(
 		bytes += size;
 		const { why } = m;
 		lines.push(
-			`‹${OUTLINE_TOOL_TEXT.edit.mergedBlock(why.sid, whoChanged(why.by), why.now, why.seen)}›`,
+			`‹${OUTLINE_TOOL_TEXT.edit.mergedBlock(why.sid, whoChanged(why.by), why.now, why.seen ?? 0)}›`,
 		);
 		lines.push(text);
 	}

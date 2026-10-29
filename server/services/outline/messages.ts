@@ -168,13 +168,25 @@ export const OUTLINE_TOOL_TEXT = {
 			`a page titled ${quoted(title)} already existed: ${list(addresses.map((a) => `[[${a}]]`))}; merge them if they are the same`,
 		busy: "the space kept changing while the edit was written; nothing was written, try again",
 		conflictHeader:
-			"Nothing was written: blocks you are changing changed after you last read them, and your edits could not be merged with those changes.",
+			"Nothing was written: blocks you are changing (or deleting with what is under them) changed after you last read them, or you have not read them, and your edits could not be merged with those changes.",
 		someone: "someone",
 		aPerson: "a person",
 		anotherAgent: "another agent",
 		theSystem: "the system",
 		conflict: (sid: string, who: string, now: number, seen: number) =>
 			`[${sid}] was changed by ${who} in commit #${now} (you read it as of #${seen})`,
+		notRead: (sid: string, who: string, now: number) =>
+			`[${sid}] was last written by ${who} in commit #${now}, and you have not read it`,
+		readFirst:
+			"Read a block before you replace or delete what someone else wrote in it; what you read is forgotten when the server restarts.",
+		underDeleted: (sid: string) => `it is under [${sid}], which you are deleting with it`,
+		tooLargeToDelete: (sid: string, max: number) =>
+			`[${sid}] has more than ${max} blocks under it, too many to check what changed in them since you read them; delete it in smaller parts, the blocks under it first`,
+		shownBelow: "its current text is shown in full below",
+		shownHeader:
+			"They read as follows now. Shown here, they count as read: redo the edit on this text, or make the same edit again if it still holds:",
+		moreConflicts: (n: number) =>
+			`… and ${n === 1 ? "1 more block" : `${n} more blocks`} like these, not listed`,
 		nowReads: (text: string) => `it now reads: ${text}`,
 		notMerged:
 			"only a block's one replace is merged with later changes; a move, delete or set (or several edits of one block) needs the block as you read it",
