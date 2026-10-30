@@ -38,7 +38,7 @@ import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import "../../../lib/agent/tools";
 import { OUTLINE_EDIT_LIMITS } from "../agent-edit";
-import { AGENT_MERGE_LIMITS } from "../agent-merge";
+import { AGENT_MERGE_HOOKS, AGENT_MERGE_LIMITS } from "../agent-merge";
 import { OUTLINE_EDIT_TEXT_LIMITS, stopEditTextWorker } from "../edit-text-runner";
 import { OUTLINE_CHANGE } from "../model";
 import { clearOutlineReads, recordOutlineReads, seenOutlineVersion } from "../read-ledger";
@@ -47,6 +47,7 @@ import { invalidateSessionReadScopes } from "../session-scope";
 import { ensureProjectSpace, ensureSessionSpace } from "../spaces";
 import { outlineStore } from "../store";
 import type { OutlineSpaceRow } from "../store/port";
+import { OUTLINE_LAST_WRITES_SCAN } from "../store/read-port";
 import { type OutlineOp, writeOutline } from "../write";
 
 const NOW = "2026-10-26T00:00:00.000Z";
@@ -155,6 +156,16 @@ async function world(name = "Atlas"): Promise<World> {
 	const session = await narrator(alice, projectId);
 	const space = await ensureProjectSpace(projectId);
 	return { alice, projectId, session, space };
+}
+
+/** A page of blocks the agent wrote and then read; their sids and ids. */
+async function readBlocksOf(w: World, c: ToolContext, texts: string[]) {
+	const markdown = ["- Notes", ...texts.map((t) => `  - ${t}`)].join("\n");
+	const added = await call(outlineEditTool, { edits: [{ add: "/", markdown }] }, c);
+	const created = ids(added.output);
+	await call(outlineReadTool, { address: created[0] as string, view: "all" }, c);
+	const rows = await stored(w.space);
+	return created.slice(1).map((sid) => ({ sid, id: rows.get(sid)?.id as string }));
 }
 
 beforeEach(() => {
@@ -1412,6 +1423,184 @@ describe("OutlineEdit delete and what is under the block", () => {
 		const moved = await call(outlineEditTool, { edits: [{ move: a, to: b }] }, c);
 		expect(moved.isError).toBeUndefined();
 		expect((await stored(w.space)).get(child)?.content).toBe("under A, edited");
+	});
+});
+
+describe("OutlineEdit read rules at their edges", () => {
+	test("a set of an unread block under a block the call deletes does not hide it", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{ edits: [{ add: "/", markdown: "- Agent page\n  - Agent section" }] },
+			c,
+		);
+		const section = ids(added.output)[1] as string;
+		const sectionId = (await stored(w.space)).get(section)?.id as string;
+		const r = await humanWrite(w.space, w.alice, [
+			{ op: "insert", parent: { id: sectionId }, content: "a person's careful notes" },
+		]);
+		const theirs = r.results[0]?.sid as string;
+		const both = await call(
+			outlineEditTool,
+			{
+				edits: [{ set: theirs, checkbox: "x" }, { delete: section }],
+			},
+			c,
+		);
+		expect(both.isError).toBe(true);
+		expect(both.output).toContain(`[${theirs}] was last written by a person`);
+		expect(both.output).toContain(`it is under [${section}], which you are deleting with it`);
+		expect((await stored(w.space)).get(theirs)?.deleted).toBe(false);
+	});
+
+	test("after a restart, the agent's own merge is not taken as text it wrote", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [a, b] = await readBlocksOf(w, c, ["Alpha text.", "Beta text."]);
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: a.id }, content: "Alpha text. Human A." },
+			{ op: "update", block: { id: b.id }, content: "Beta text. Human B." },
+		]);
+		const limits = OUTLINE_EDIT_LIMITS as { maxMergedBytes: number };
+		const saved = limits.maxMergedBytes;
+		limits.maxMergedBytes = 1;
+		try {
+			const merged = await call(
+				outlineEditTool,
+				{
+					edits: [
+						{ replace: a.sid, text: "Agent: Alpha text." },
+						{ replace: b.sid, text: "Agent: Beta text." },
+					],
+				},
+				c,
+			);
+			expect(merged.output).toContain(`also merged, not shown here: [${b.sid}]`);
+		} finally {
+			limits.maxMergedBytes = saved;
+		}
+		clearOutlineReads(); // a restart
+		const again = await call(
+			outlineEditTool,
+			{ edits: [{ replace: b.sid, text: "Agent v2: Beta text." }] },
+			c,
+		);
+		expect(again.isError).toBe(true);
+		expect(again.output).toContain(`[${b.sid}] was last written by someone`);
+		expect(again.output).toContain(`- [${b.sid}] Agent: Beta text. Human B.`);
+		expect((await stored(w.space)).get(b.sid)?.content).toBe("Agent: Beta text. Human B.");
+	});
+
+	test("after a restart, a person's move of the agent's blocks is not their text", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ add: "/", markdown: "- Agent page\n  - Section\n    - one\n    - two" },
+					{ add: "/", markdown: "- Other page" },
+				],
+			},
+			c,
+		);
+		const [, section, one, two, other] = ids(added.output) as [
+			string,
+			string,
+			string,
+			string,
+			string,
+		];
+		const rows = await stored(w.space);
+		await humanWrite(w.space, w.alice, [
+			{
+				op: "move",
+				block: { id: rows.get(section)?.id as string },
+				parent: { id: rows.get(other)?.id as string },
+			},
+		]);
+		clearOutlineReads(); // a restart
+		// A checkbox the person set is theirs, though: that block needs a read.
+		await humanWrite(w.space, w.alice, [
+			{ op: "setTask", block: { id: rows.get(two)?.id as string }, task: { status: "done" } },
+		]);
+		const refused = await call(outlineEditTool, { edits: [{ delete: section }] }, c);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain(`[${two}] was last written by a person`);
+		expect(refused.output).not.toContain(`[${one}] was`);
+		expect(refused.output).not.toContain(`[${section}] was`);
+		const del = await call(outlineEditTool, { edits: [{ delete: section }] }, c);
+		expect(del.isError).toBeUndefined();
+	});
+
+	test("past the scan of a block's versions, someone else is assumed to have written it", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ add: "/", markdown: "- Page one\n  - Section\n    - child" },
+					{ add: "/", markdown: "- Page two" },
+				],
+			},
+			c,
+		);
+		const [p1, section, child, p2] = ids(added.output) as [string, string, string, string];
+		await call(outlineReadTool, { address: p1 }, c);
+		// The agent moves the section between pages again and again: every move writes a page
+		// change of the child, by the agent, past what one check looks through.
+		for (let i = 0; i <= OUTLINE_LAST_WRITES_SCAN; i++) {
+			const moved = await call(
+				outlineEditTool,
+				{ edits: [{ move: section, to: i % 2 ? p1 : p2 }] },
+				c,
+			);
+			expect(moved.isError).toBeUndefined();
+		}
+		const refused = await call(outlineEditTool, { edits: [{ delete: section }] }, c);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain(`[${child}] was changed by someone`);
+		expect((await stored(w.space)).get(child)?.deleted).toBe(false);
+	});
+
+	test("the merge's time budget covers waiting for the text runner", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [a] = await readBlocksOf(w, c, ["Short text."]);
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: a.id }, content: "Short text. More." },
+		]);
+		const saved = { run: AGENT_MERGE_HOOKS.run, timeMs: AGENT_MERGE_LIMITS.timeMs };
+		let cancelled = false;
+		// A runner busy with other jobs: this one would start only after a while.
+		AGENT_MERGE_HOOKS.run = (job, options) =>
+			new Promise((resolve, reject) => {
+				const t = setTimeout(() => resolve(saved.run(job, options)), 400);
+				options.signal?.addEventListener("abort", () => {
+					cancelled = true;
+					clearTimeout(t);
+					reject(new Error("cancelled"));
+				});
+			});
+		AGENT_MERGE_LIMITS.timeMs = 50;
+		try {
+			const started = Date.now();
+			const slow = await call(
+				outlineEditTool,
+				{ edits: [{ replace: a.sid, text: "Short text!" }] },
+				c,
+			);
+			expect(Date.now() - started).toBeLessThan(350);
+			expect(slow.isError).toBe(true);
+			expect(slow.output).toContain("took longer than");
+			expect(cancelled).toBe(true);
+		} finally {
+			AGENT_MERGE_HOOKS.run = saved.run;
+			AGENT_MERGE_LIMITS.timeMs = saved.timeMs;
+		}
+		expect((await stored(w.space)).get(a.sid)?.content).toBe("Short text. More.");
 	});
 });
 

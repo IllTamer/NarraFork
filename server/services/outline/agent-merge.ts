@@ -26,6 +26,7 @@ import {
 	editTextJobBytes,
 } from "./edit-text";
 import {
+	type EditTextRunOptions,
 	OUTLINE_EDIT_TEXT_LIMITS,
 	OutlineEditTextError,
 	processEditText,
@@ -233,23 +234,41 @@ async function mergeTexts(
 	const run = async () => {
 		if (batch.length === 0) return;
 		const left = deadline - Date.now();
-		if (left <= 0)
-			throw new AgentMergeLimitError(
-				OUTLINE_TOOL_TEXT.edit.mergeTooSlow(AGENT_MERGE_LIMITS.timeMs),
-			);
+		const tooSlow = () =>
+			new AgentMergeLimitError(OUTLINE_TOOL_TEXT.edit.mergeTooSlow(AGENT_MERGE_LIMITS.timeMs));
+		if (left <= 0) throw tooSlow();
+		// The budget covers waiting for the text runner too (other jobs may be queued ahead):
+		// past it the job is cancelled and its result dropped, whether it ran or still waits.
+		const controller = new AbortController();
+		const cancel = () => controller.abort();
+		signal?.addEventListener("abort", cancel, { once: true });
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let timedOut = false;
+		const expired = new Promise<never>((_, reject) => {
+			timer = setTimeout(() => {
+				timedOut = true;
+				reject(tooSlow());
+				controller.abort();
+			}, left);
+		});
+		const job = AGENT_MERGE_HOOKS.run(
+			{ kind: "merge", merges: batch },
+			{ signal: controller.signal, timeoutMs: Math.min(left, OUTLINE_EDIT_TEXT_LIMITS.timeoutMs) },
+		);
+		// Lost the race: its rejection (cancelled) has nobody to tell.
+		job.catch(() => {});
 		try {
-			out.push(
-				...(await processEditText(
-					{ kind: "merge", merges: batch },
-					{ signal, timeoutMs: Math.min(left, OUTLINE_EDIT_TEXT_LIMITS.timeoutMs) },
-				)),
-			);
+			out.push(...(await Promise.race([job, expired])));
 		} catch (error) {
-			if (error instanceof OutlineEditTextError && error.code === "OUTLINE_TEXT_TIMEOUT")
-				throw new AgentMergeLimitError(
-					OUTLINE_TOOL_TEXT.edit.mergeTooSlow(AGENT_MERGE_LIMITS.timeMs),
-				);
+			if (
+				timedOut ||
+				(error instanceof OutlineEditTextError && error.code === "OUTLINE_TEXT_TIMEOUT")
+			)
+				throw tooSlow();
 			throw error;
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", cancel);
 		}
 		batch = [];
 		bytes = 0;
@@ -269,6 +288,14 @@ export const AGENT_MERGE_LIMITS = {
 	/** All the merges of one call: past this the call is refused, nothing written. */
 	timeMs: 5_000,
 };
+
+/** Where merges run; tests replace it (a slow runner, a busy queue). */
+export const AGENT_MERGE_HOOKS: {
+	run: (
+		job: { kind: "merge"; merges: EditTextMergeInput[] },
+		options: EditTextRunOptions,
+	) => Promise<EditTextMerged[]>;
+} = { run: (job, options) => processEditText(job, options) };
 
 /** The merges of one call would take too much (text or time); nothing was written. */
 export class AgentMergeLimitError extends Error {

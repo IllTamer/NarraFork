@@ -149,6 +149,8 @@ export const OUTLINE_EDIT_LIMITS = {
 
 /** Change flags that leave out every version of an actor (`findLastWrites`). */
 const ALL_CHANGES = 0x7fffffff;
+/** Change flags of a move: anyone's moves and page changes say nothing about the text. */
+const MOVES = OUTLINE_CHANGE.MOVE | OUTLINE_CHANGE.PAGE;
 /**
  * Change flags of the agent's own versions that leave the text as it was (moves, page changes,
  * checkbox and properties): they do not tell that it knows the text, and are left out.
@@ -735,10 +737,14 @@ export async function outlineEdit(
 			// Who wrote what the agent is changing or deleting, since it read it: any version after
 			// its read by someone else (its own versions left out: a move of its own writes a page
 			// change for every block under the moved one, which says nothing about what others
-			// wrote). A block it never read (or not since a restart): the latest version that is not
-			// one of its own leaving the text as it was (a move, a set), by someone else.
+			// wrote). A block it never read (or not since a restart): the latest version that
+			// changed more than where the block sits (anyone's moves are left out, and the agent's
+			// own moves, checkboxes and properties), when someone else wrote it, or the agent merged
+			// it with what someone else wrote. Past the scan bound of either read: assume someone
+			// else did.
 			const replacedOrDeleted = (blockId: string) =>
 				(editsOf.get(blockId) ?? []).some((e) => e.kind === "replace" || e.kind === "delete");
+			const underIds = new Set(under.blocks.map((b) => b.meta.id));
 			const candidates = new Map<string, OutlineBlockMeta>();
 			for (const m of current.values()) candidates.set(m.id, m);
 			for (const b of under.blocks)
@@ -749,7 +755,7 @@ export async function outlineEdit(
 				const seen = seenOf(m.id);
 				if (seen !== undefined) {
 					if (m.versionSeq > seen) checkedSinceRead.push({ blockId: m.id, afterSeq: seen });
-				} else if (!current.has(m.id) || replacedOrDeleted(m.id)) {
+				} else if (underIds.has(m.id) || replacedOrDeleted(m.id)) {
 					checkedUnread.push({ blockId: m.id, afterSeq: 0 });
 				}
 			}
@@ -764,27 +770,37 @@ export async function outlineEdit(
 			const lastWrite = new Map(
 				checkedUnread.length === 0
 					? []
-					: (await scope.store.findLastWrites(checkedUnread, { ...self, flags: OWN_NOT_TEXT })).map(
-							(r) => [r.blockId, r.fromSeq],
-						),
+					: (
+							await scope.store.findLastWrites(checkedUnread, {
+								...self,
+								flags: OWN_NOT_TEXT,
+								anyoneFlags: MOVES,
+							})
+						).map((r) => [r.blockId, r]),
 			);
+			const seqs = [
+				...byOthersSince.values(),
+				...[...lastWrite.values()].map((r) => r.fromSeq),
+			].filter((seq): seq is number => seq !== null);
 			const commits = new Map(
-				(
-					await scope.store.getCommitsBySeqs(space.id, [
-						...new Set([...byOthersSince.values(), ...lastWrite.values()]),
-					])
-				).map((c) => [c.seq, c]),
+				(await scope.store.getCommitsBySeqs(space.id, [...new Set(seqs)])).map((c) => [c.seq, c]),
 			);
 			const isOwn = (seq: number) => {
 				const commit = commits.get(seq);
 				return commit?.actorKind === "agent" && commit.actorId === scope.narratorId;
 			};
-			/** The version by someone else that the agent has not seen, if there is one. */
-			const unseenWrite = (blockId: string): number | undefined => {
-				const since = byOthersSince.get(blockId);
-				if (since !== undefined) return since;
-				const last = lastWrite.get(blockId);
-				return last !== undefined && !isOwn(last) ? last : undefined;
+			/**
+			 * The version by someone else the agent has not seen, if there is one: its seq, or the
+			 * block's current one when the scan bound hid it.
+			 */
+			const unseenWrite = (m: OutlineBlockMeta): number | undefined => {
+				if (byOthersSince.has(m.id)) return byOthersSince.get(m.id) ?? m.versionSeq;
+				const last = lastWrite.get(m.id);
+				if (!last) return undefined;
+				if (last.fromSeq === null) return m.versionSeq;
+				const ownText =
+					isOwn(last.fromSeq) && ((last.changeFlags ?? 0) & OUTLINE_CHANGE.MERGE) === 0;
+				return ownText ? undefined : last.fromSeq;
 			};
 			const why = (
 				m: OutlineBlockMeta,
@@ -795,13 +811,13 @@ export async function outlineEdit(
 				sid: m.sid,
 				seen: seenOf(m.id) ?? null,
 				now: seq,
-				by: commits.get(seq),
+				// Its own version (a merge it wrote, or the scan bound hid the other's): "someone".
+				by: isOwn(seq) ? undefined : commits.get(seq),
 				...extra,
 			});
-			const changed = [...current.values()].flatMap((m) => {
-				const seq = byOthersSince.get(m.id);
-				return seq === undefined ? [] : [why(m, seq)];
-			});
+			const changed = [...current.values()].flatMap((m) =>
+				byOthersSince.has(m.id) ? [why(m, unseenWrite(m) as number)] : [],
+			);
 			// Only a block's one replace is merged; a move, delete or set needs the block as read.
 			const replaceOf = (blockId: string) => {
 				const list = editsOf.get(blockId) ?? [];
@@ -810,12 +826,13 @@ export async function outlineEdit(
 			// Never read (or not since the server started): a replace or delete of what someone
 			// else wrote needs a read first (design §6.5, the read cache gone: any change refuses).
 			const unread = [...current.values()].flatMap((m) => {
-				const seq = seenOf(m.id) === undefined ? unseenWrite(m.id) : undefined;
+				const seq =
+					seenOf(m.id) === undefined && replacedOrDeleted(m.id) ? unseenWrite(m) : undefined;
 				return seq === undefined ? [] : [why(m, seq, { shown: true })];
 			});
 			const sidOf = (id: string) => current.get(id)?.sid ?? id;
 			const underChanged = under.blocks.flatMap((b) => {
-				const seq = unseenWrite(b.meta.id);
+				const seq = unseenWrite(b.meta);
 				return seq === undefined ? [] : [why(b.meta, seq, { under: sidOf(b.rootId), shown: true })];
 			});
 			const tooLarge = under.overflow.flatMap(({ rootId, limit }) => {

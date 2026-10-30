@@ -21,7 +21,7 @@ import { listBacklinks, resolveAddress } from "../resolve";
 import { revertCommit } from "../revert";
 import { searchOutline } from "../search";
 import type { OutlineSpaceRow, OutlineVersionRow } from "../store/port";
-import { OUTLINE_PAGE_HEAD_CHARS } from "../store/read-port";
+import { OUTLINE_LAST_WRITES_SCAN, OUTLINE_PAGE_HEAD_CHARS } from "../store/read-port";
 import { type OutlineNode, subtreeNodes } from "../tree";
 import type { OutlineOp, OutlineWriteInput, OutlineWriteResult } from "../write";
 import { writeOutline } from "../write";
@@ -674,6 +674,43 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 					flags: ALL,
 				}),
 			).toEqual([]);
+
+			// With its change flags; anyone's moves left out on request.
+			const full = await ctx.store.findLastWrites([{ blockId: x, afterSeq: 0 }], {
+				actorKind: "agent",
+				actorId: "someone-else",
+				flags: ALL,
+				anyoneFlags: MOVES,
+			});
+			expect(full).toEqual([
+				{
+					blockId: x,
+					fromSeq: s4,
+					changeFlags: (await ctx.store.listVersionsAtSeqs([{ blockId: x, seq: s4 }]))[0]
+						?.changeFlags as number,
+				},
+			]);
+
+			// The scan stops after the newest versions: past them, unknown (fromSeq null) unless
+			// one of those counts.
+			const many = a0(
+				await write(ctx, space, [{ op: "insert", parent: { id: pageA }, content: "moved a lot" }]),
+			);
+			for (let i = 0; i < OUTLINE_LAST_WRITES_SCAN + 2; i++) {
+				await seq([{ op: "move", block: { id: many }, parent: { id: i % 2 ? pageA : pageB } }]);
+			}
+			const scanned = (flags: number) =>
+				ctx.store.findLastWrites([{ blockId: many, afterSeq: 0 }], {
+					actorKind: "agent",
+					actorId: agent.id,
+					flags,
+				});
+			expect(await scanned(ALL)).toEqual([{ blockId: many, fromSeq: null, changeFlags: null }]);
+			const latest = await seq(
+				[{ op: "update", block: { id: many }, content: "moved a lot, then edited" }],
+				ACTOR,
+			);
+			expect((await scanned(ALL))[0]?.fromSeq).toBe(latest);
 		},
 	},
 	{
