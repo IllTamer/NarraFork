@@ -24,8 +24,13 @@ import { settings } from "../../../lib/settings";
 import { OUTLINE_AGENT_READ_LIMITS } from "../agent-read";
 import { OUTLINE_TOOL_TEXT } from "../messages";
 import { clearOutlineReads, seenOutlineVersion } from "../read-ledger";
-import { invalidateSessionReadScopes } from "../session-scope";
+import {
+	invalidateSessionReadScopes,
+	listSessionReadableSpaces,
+	OUTLINE_SESSION_LIST_LIMITS,
+} from "../session-scope";
 import { ensurePersonalSpace, ensureProjectSpace, ensureSessionSpace } from "../spaces";
+import { outlineStore } from "../store";
 import type { OutlineSpaceRow } from "../store/port";
 import { type OutlineOp, writeOutline } from "../write";
 
@@ -389,45 +394,117 @@ describe("the overview of every readable space", () => {
 		expect(byKey.output).toContain(`- [${w.otherNotes.key}/${repro}] Repro steps`);
 	});
 
-	test("pages that are tasks, pages too large to expand, and spaces past the budget", async () => {
+	test("pages that are tasks take nothing from the budget; pages not expanded say why", async () => {
 		const w = await world();
 		await write(w.atlas, w.alice, [
-			{ op: "insert", parent: null, content: "A task page", task: { status: "todo" } },
+			{ op: "insert", parent: null, content: "Task one", task: { status: "todo" } },
+			{ op: "insert", parent: null, content: "Task two", task: { status: "todo" } },
+			{ op: "insert", parent: null, content: "Plain page" },
 		]);
-		const big = Array.from({ length: OUTLINE_AGENT_READ_LIMITS.overviewPageBlocks }, (_, i) => ({
-			op: "insert" as const,
-			parent: { tempId: "big" },
-			content: `line ${i}`,
-		}));
+		const lines = (n: number, tempId: string) =>
+			Array.from({ length: n }, (_, i) => ({
+				op: "insert" as const,
+				parent: { tempId },
+				content: `line ${i}`,
+			}));
 		const [bigPage] = await write(w.billing, w.alice, [
 			{ op: "insert", tempId: "big", parent: null, content: "Big page" },
-			...big.slice(0, 199),
+			...lines(6, "big"),
 		]);
-		await write(
-			w.billing,
-			w.alice,
-			big.slice(199, 398).map((op) => ({
-				...op,
-				parent: { sid: bigPage as string },
-			})) as OutlineOp[],
-		);
-		await write(
-			w.billing,
-			w.alice,
-			big.slice(398).map((op) => ({
-				...op,
-				parent: { sid: bigPage as string },
-			})) as OutlineOp[],
-		);
+		await write(w.billing, w.alice, [
+			{ op: "insert", tempId: "small", parent: null, content: "Small page" },
+			...lines(2, "small"),
+		]);
 		const c = ctx(w.session, w.alice);
-		const result = await call(outlineReadTool, { address: "*" }, c);
-		expect(result.output).toContain(OUTLINE_TOOL_TEXT.taskPagesHidden(1));
-		expect(result.output).toContain(`- [${w.billing.key}/${bigPage}] Big page`);
-		expect(result.output).toContain(
-			OUTLINE_TOOL_TEXT.notExpanded([`[${w.billing.key}/${bigPage}]`]),
-		);
-		expect(result.output).not.toContain("line 0");
-		expect(result.metadata?.truncated).toBe(true);
+		// Budget 1: the task pages are listed before the plain page but do not take its place.
+		const one = await call(outlineReadTool, { address: "*", budget: 1 }, c);
+		expect(one.output).toContain("Plain page");
+		expect(one.output).toContain(OUTLINE_TOOL_TEXT.taskPagesHidden(2));
+		const limits = OUTLINE_AGENT_READ_LIMITS;
+		const saved = { ...limits };
+		try {
+			// One read takes 5 blocks: the 7-block page shows alone, the 3-block one whole.
+			limits.overviewBlocksPerRead = 5;
+			const large = await call(outlineReadTool, { address: "*" }, c);
+			expect(large.output).toContain(`- [${w.billing.key}/${bigPage}] Big page`);
+			expect(large.output).toContain(
+				OUTLINE_TOOL_TEXT.notExpandedLarge([`[${w.billing.key}/${bigPage}]`]),
+			);
+			expect(large.output).not.toContain("line 5");
+			expect(large.output).toMatch(/Small page\n {2}- \[[^\]]+\] line 0/);
+			expect(large.metadata?.truncated).toBe(true);
+			// Past what one overview reads in all: shown alone, and said so.
+			limits.overviewBlocksPerRead = saved.overviewBlocksPerRead;
+			limits.overviewBlocks = 2;
+			const past = await call(outlineReadTool, { address: "*" }, c);
+			expect(past.output).toMatch(
+				/shown without what is under them, past the blocks one overview reads/,
+			);
+			expect(past.output).not.toContain("line 0");
+			const meta = past.metadata?.spaces as Array<{ key: string; pages: number }>;
+			expect(meta.find((s) => s.key === w.billing.key)?.pages).toBe(2);
+			expect(meta.find((s) => s.key === w.atlas.key)?.pages).toBe(1);
+		} finally {
+			Object.assign(limits, saved);
+		}
+	});
+
+	test("every space shows its pages, round-robin; structure is read in a few batched reads", async () => {
+		const owner = await user("wide");
+		const main = await project(owner, "Main");
+		const session = await narrator(owner, main);
+		const spaces = [await ensureProjectSpace(main)];
+		for (let i = 0; i < 11; i++)
+			spaces.push(await ensureProjectSpace(await project(owner, `P${i}`)));
+		for (const space of spaces) {
+			const ops: OutlineOp[] = [];
+			for (let p = 0; p < 6; p++) {
+				ops.push({
+					op: "insert",
+					tempId: `p${p}`,
+					parent: null,
+					content: `${space.key} page ${p}`,
+				});
+				for (let k = 0; k < 3; k++) {
+					ops.push({ op: "insert", parent: { tempId: `p${p}` }, content: `child ${p}.${k}` });
+				}
+			}
+			await write(space, owner, ops);
+		}
+		const store = outlineStore as unknown as Record<string, (...args: unknown[]) => unknown>;
+		const calls = { single: 0, batched: 0 };
+		const single = store.listPageStructure as (...args: unknown[]) => unknown;
+		const batched = store.listPagesStructure as (...args: unknown[]) => unknown;
+		store.listPageStructure = (...args) => {
+			calls.single++;
+			return single.apply(outlineStore, args);
+		};
+		store.listPagesStructure = (...args) => {
+			calls.batched++;
+			return batched.apply(outlineStore, args);
+		};
+		try {
+			const c = ctx(session, owner);
+			const wide = await call(outlineReadTool, { address: "*", budget: 2000 }, c);
+			const sections = wide.output.split(/\n(?=‹space )/).slice(1);
+			expect(sections).toHaveLength(12);
+			for (const section of sections) {
+				expect((section.match(/^- \[/gm) ?? []).length).toBe(6);
+				expect((section.match(/^ {2}- \[/gm) ?? []).length).toBe(18);
+			}
+			expect(calls.single).toBe(0);
+			expect(calls.batched).toBe(1);
+			// A small budget takes the first page of every space before any second page.
+			const small = await call(outlineReadTool, { address: "*", budget: 12 }, c);
+			for (const space of spaces) {
+				expect(small.output).toContain(`${space.key} page 0`);
+				expect(small.output).not.toContain(`${space.key} page 1`);
+				expect(small.output).toContain(OUTLINE_TOOL_TEXT.morePagesOf(space.key, 5, false));
+			}
+		} finally {
+			store.listPageStructure = single;
+			store.listPagesStructure = batched;
+		}
 	});
 
 	test("a session that can read nothing yet", async () => {
@@ -566,6 +643,57 @@ describe("OutlineEdit and other spaces", () => {
 		]);
 	});
 
+	test("an edit's result labels blocks of another space by an address that works as is", async () => {
+		const w = await world();
+		const key = w.billing.key;
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{ edits: [{ add: `${key}/`, markdown: "- Invoices\n  - Totals in cents" }] },
+			c,
+		);
+		const created = labels(added.output);
+		expect(created).toHaveLength(2);
+		for (const label of created) {
+			expect(label).toStartWith(`${key}/`);
+			const read = await call(outlineReadTool, { address: label }, c);
+			expect(read.isError).toBeUndefined();
+			// The label of a read result, copied with its brackets, works too.
+			const replaced = await call(
+				outlineEditTool,
+				{ edits: [{ replace: `[${label}]`, text: `edited ${label}` }] },
+				c,
+			);
+			expect(replaced.isError).toBeUndefined();
+			expect(replaced.output).toContain(`replaced [${label}]`);
+		}
+		const [page, child] = created as [string, string];
+		const moved = await call(outlineEditTool, { edits: [{ move: child, to: `${key}/` }] }, c);
+		expect(moved.isError).toBeUndefined();
+		expect(moved.output).toContain(`moved [${child}] under`);
+		const back = await call(outlineEditTool, { edits: [{ move: child, to: page }] }, c);
+		expect(back.output).toContain(`moved [${child}] under [${page}]`);
+		const set = await call(outlineEditTool, { edits: [{ set: child, checkbox: "x" }] }, c);
+		expect(set.output).toContain(`set [${child}]: [x]`);
+		// Someone changes a block after the agent read it: the conflict names it by its address.
+		await call(outlineReadTool, { address: page }, c);
+		const pageRow = await blockBySid(w.billing, page.slice(key.length + 1));
+		await writeOutline({
+			spaceId: w.billing.id,
+			ops: [{ op: "update", block: { id: pageRow.id }, content: "Invoices by a person" }],
+			actor: { kind: "human", id: w.alice },
+			responsibleUserId: w.alice,
+		});
+		const conflict = await call(outlineEditTool, { edits: [{ set: page, checkbox: "x" }] }, c);
+		expect(conflict.isError).toBe(true);
+		expect(conflict.output).toContain(`[${page}] was changed by a person`);
+		// In the session's own space the short id stays.
+		const own = await call(outlineEditTool, { edits: [{ add: "/", markdown: "- Ours" }] }, c);
+		const ownLabel = labels(own.output)[0] as string;
+		expect(ownLabel).not.toContain("/");
+		expect((await call(outlineReadTool, { address: ownLabel }, c)).isError).toBeUndefined();
+	});
+
 	test("a subagent reads across spaces as its root does", async () => {
 		const w = await world();
 		const [invoices] = await write(w.billing, w.alice, [
@@ -585,5 +713,136 @@ describe("OutlineEdit and other spaces", () => {
 			c,
 		);
 		expect(own.isError).toBeUndefined();
+	});
+});
+
+describe("limits of what one listing looks at", () => {
+	/** A session of Alice's with `extra` more projects of hers; shared with Bob when asked. */
+	async function setup(extra: number, sharedWithBob: boolean) {
+		const alice = await user("alice");
+		const bob = await user("bob");
+		const main = await project(alice, "Main");
+		const session = await narrator(alice, main);
+		const ids = new Set([
+			(await ensureProjectSpace(main)).id,
+			(await ensureSessionSpace(session)).id,
+		]);
+		const grant = (scopeType: "project" | "narrator", scopeId: string) =>
+			db.insert(aclGrants).values({
+				id: generateId(),
+				scopeType,
+				scopeId,
+				principalType: "user",
+				principalId: bob,
+				capability: "read",
+				createdAt: NOW,
+			});
+		if (sharedWithBob) {
+			await grant("project", main);
+			await grant("narrator", session);
+		}
+		for (let i = 0; i < extra; i++) {
+			ids.add((await ensureProjectSpace(await project(alice, `Extra ${i}`))).id);
+		}
+		invalidateSessionReadScopes();
+		// Other cases of this file leave public projects every session may read: count ours.
+		const ours = (spaces: OutlineSpaceRow[]) => spaces.filter((space) => ids.has(space.id));
+		return { alice, session, ours };
+	}
+
+	test("a listing cut by its limit says more are readable; one cut by its candidates cannot tell", async () => {
+		const solo = await setup(4, false);
+		const all = await listSessionReadableSpaces(solo.session, {
+			executingUserId: solo.alice,
+			limit: 200,
+		});
+		expect(all).toMatchObject({ cut: null, complete: true });
+		expect(solo.ours(all.spaces)).toHaveLength(6);
+		const two = await listSessionReadableSpaces(solo.session, {
+			executingUserId: solo.alice,
+			limit: 2,
+		});
+		expect(two).toMatchObject({ cut: "limit", complete: false });
+		expect(two.spaces).toHaveLength(2);
+
+		// Shared with Bob, Alice's other projects are candidates Bob cannot read.
+		const shared = await setup(5, true);
+		const capped = await listSessionReadableSpaces(shared.session, {
+			executingUserId: shared.alice,
+			limit: 200,
+			maxCandidates: 3,
+		});
+		expect(capped).toMatchObject({ cut: "candidates", complete: false });
+		expect(shared.ours(capped.spaces)).toHaveLength(2);
+		const whole = await listSessionReadableSpaces(shared.session, {
+			executingUserId: shared.alice,
+			limit: 200,
+		});
+		expect(whole).toMatchObject({ cut: null, complete: true });
+		expect(shared.ours(whole.spaces)).toHaveLength(2);
+	});
+
+	test("the overview and the search of every space say which, past their own limits", async () => {
+		const reads = OUTLINE_AGENT_READ_LIMITS;
+		const lists = OUTLINE_SESSION_LIST_LIMITS;
+		const saved = { reads: { ...reads }, lists: { ...lists } };
+		try {
+			reads.overviewSpaces = 2;
+			reads.searchAllSpaces = 2;
+			const solo = await setup(4, false);
+			const c = ctx(solo.session, solo.alice);
+			const overview = await call(outlineReadTool, { address: "*" }, c);
+			expect(overview.metadata?.spaces).toHaveLength(2);
+			expect(overview.metadata?.complete).toBe(false);
+			expect(overview.output).toContain(OUTLINE_TOOL_TEXT.moreSpaces);
+			expect(overview.output).not.toContain(OUTLINE_TOOL_TEXT.spacesUnchecked);
+			const search = await call(outlineSearchTool, { query: "anything", spaces: ["*"] }, c);
+			expect(search.metadata?.spaces).toHaveLength(2);
+			expect(search.metadata?.complete).toBe(false);
+			expect(search.output).toContain(OUTLINE_TOOL_TEXT.searchedSome(2));
+
+			reads.overviewSpaces = saved.reads.overviewSpaces;
+			reads.searchAllSpaces = saved.reads.searchAllSpaces;
+			lists.defaultCandidates = 3;
+			const shared = await setup(5, true);
+			const s = ctx(shared.session, shared.alice);
+			const unchecked = await call(outlineReadTool, { address: "*" }, s);
+			expect(unchecked.metadata?.complete).toBe(false);
+			expect(unchecked.output).toContain(OUTLINE_TOOL_TEXT.spacesUnchecked);
+			expect(unchecked.output).not.toContain(OUTLINE_TOOL_TEXT.moreSpaces);
+			const searched = await call(outlineSearchTool, { query: "anything", spaces: ["*"] }, s);
+			expect(searched.output).toContain(OUTLINE_TOOL_TEXT.searchUnchecked);
+			expect(searched.output).not.toContain("there are more");
+		} finally {
+			Object.assign(reads, saved.reads);
+			Object.assign(lists, saved.lists);
+		}
+	});
+
+	test("a long listing yields to the event loop between slices of candidates", async () => {
+		const lists = OUTLINE_SESSION_LIST_LIMITS;
+		const saved = { ...lists };
+		const solo = await setup(12, false);
+		let ticks = 0;
+		let running = true;
+		const tick = () => {
+			ticks++;
+			if (running) setImmediate(tick);
+		};
+		try {
+			lists.judgeSlice = 3;
+			setImmediate(tick);
+			const listed = await listSessionReadableSpaces(solo.session, {
+				executingUserId: solo.alice,
+				limit: 200,
+			});
+			running = false;
+			expect(solo.ours(listed.spaces)).toHaveLength(14);
+			// Twelve candidates judged three at a time: other work ran in between.
+			expect(ticks).toBeGreaterThanOrEqual(3);
+		} finally {
+			running = false;
+			Object.assign(lists, saved);
+		}
 	});
 });

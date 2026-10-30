@@ -31,7 +31,7 @@
  * keeps the tail and would lose the top of the outline).
  */
 import { blockTitle, serializeMarkdownOutline, TASK_BOX } from "@shared/outline";
-import { type OutlineAgentScope, spaceRootName } from "./agent-scope";
+import { type OutlineAgentScope, type OutlineSpaceWord, spaceRootName } from "./agent-scope";
 import { LINK_DISPLAY_LIMITS, linkTitles, withLinkTitles } from "./link-display";
 import { OUTLINE_LISTED_NAMES, OUTLINE_TOOL_TEXT } from "./messages";
 import { commitSeqAt, loadBodiesWithin, readOutline } from "./read";
@@ -43,11 +43,14 @@ import {
 	type OutlineRenderSection,
 	outlineItem,
 	renderOutlineSections,
+	sectionsBreadthFirst,
 } from "./render";
 import type { OutlineResolvedBlock } from "./resolve";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "./search";
-import type { OutlineBlockRow, OutlineSpaceRow } from "./store/port";
-import { breadthFirstForest, buildTree, type OutlineNode, type OutlineView } from "./tree";
+import { yieldToEventLoop } from "./session-scope";
+import type { OutlineBlockMeta, OutlineSpaceRow } from "./store/port";
+import type { OutlinePageListRow, OutlineStructureRow } from "./store/read-port";
+import { buildTree, type OutlineNode, type OutlineView } from "./tree";
 
 /** A tool's answer before it becomes a `ToolResult`. */
 export interface OutlineToolOutput {
@@ -59,6 +62,7 @@ export interface OutlineToolOutput {
 	bounded?: boolean;
 }
 
+/** Limits of the agent's reads (tests lower some of them). */
 export const OUTLINE_AGENT_READ_LIMITS = {
 	/** Pages listed per space when a space is read as a whole, or taken into the overview. */
 	maxPagesListed: 100,
@@ -68,13 +72,19 @@ export const OUTLINE_AGENT_READ_LIMITS = {
 	titleChars: 100,
 	/** Spaces the overview of every readable space covers. */
 	overviewSpaces: 50,
-	/** Blocks of one page the overview loads; a larger page is shown without what is under it. */
-	overviewPageBlocks: 500,
-	/** Blocks the overview loads in all; pages past that are not taken. */
-	overviewBlocks: 5000,
+	/** Pages one structure read of the overview covers. */
+	overviewPagesPerRead: 500,
+	/** Blocks one structure read of the overview returns; a page with more is shown alone. */
+	overviewBlocksPerRead: 2000,
+	/** Blocks the overview's structure reads return in all. */
+	overviewBlocks: 10_000,
+	/** Structure reads one overview makes at most. */
+	overviewReads: 10,
+	/** Spaces whose pages the overview lists between two yields to the event loop. */
+	overviewSpacesPerSlice: 10,
 	/** Spaces a search of every readable space covers. */
 	searchAllSpaces: 100,
-} as const;
+};
 
 /** The address that reads the overview of every space the session may read. */
 export const OUTLINE_ALL_SPACES = "*";
@@ -185,16 +195,16 @@ async function readOverview(scope: OutlineAgentScope): Promise<OutlineToolOutput
 	};
 }
 
-/** A page tree's node for a block row, content not loaded yet (its tags load with it). */
-function pageNode(row: OutlineBlockRow): OutlineNode {
+/** A page's node on its own, content not loaded yet (its tags load with it). */
+function pageNode(meta: OutlineBlockMeta): OutlineNode {
 	return {
-		id: row.id,
-		sid: row.sid,
+		id: meta.id,
+		sid: meta.sid,
 		parentId: null,
-		orderKey: row.orderKey,
-		alias: row.alias,
-		task: row.taskJson,
-		versionSeq: row.versionSeq,
+		orderKey: meta.orderKey,
+		alias: meta.alias,
+		task: meta.taskJson,
+		versionSeq: meta.versionSeq,
 		parent: null,
 		children: [],
 		content: null,
@@ -202,18 +212,87 @@ function pageNode(row: OutlineBlockRow): OutlineNode {
 	};
 }
 
+/** One space of the overview, before rendering. */
+interface OverviewSpace {
+	space: OutlineSpaceRow;
+	word: OutlineSpaceWord | null;
+	own: boolean;
+	header: string[];
+	/** Pages the view shows, in sibling order, as listed (titles only so far). */
+	pages: OutlinePageListRow[];
+	/** The space has more pages than one list takes. */
+	listCut: boolean;
+	/** Pages that are tasks, left out by the facts view. */
+	taskPages: number;
+	/** Another session's notes in the facts view: only counted. */
+	process?: { pages: number; more: boolean };
+	/** Pages the budget could show: the first this many of `pages`. */
+	showable: number;
+}
+
+/**
+ * The structure of the pages the overview may show, many pages per read, in the order the
+ * budget takes them: whole pages by id; `large`, pages with more blocks than one read returns;
+ * `unread`, pages past what the overview reads in all. Bounded by
+ * {@link OUTLINE_AGENT_READ_LIMITS}: rows per read, rows and reads in all; yields between reads.
+ */
+async function overviewStructure(
+	scope: OutlineAgentScope,
+	pageIds: readonly string[],
+): Promise<{
+	loaded: Map<string, OutlineStructureRow[]>;
+	large: Set<string>;
+	unread: Set<string>;
+}> {
+	const limits = OUTLINE_AGENT_READ_LIMITS;
+	const loaded = new Map<string, OutlineStructureRow[]>();
+	const large = new Set<string>();
+	let queue = [...pageIds];
+	let rowsLeft = limits.overviewBlocks;
+	let reads = 0;
+	while (queue.length > 0 && rowsLeft > 0 && reads < limits.overviewReads) {
+		if (reads > 0) await yieldToEventLoop();
+		const batch = queue.slice(0, limits.overviewPagesPerRead);
+		const limit = Math.min(limits.overviewBlocksPerRead, rowsLeft);
+		const { rows, truncated } = await scope.store.listPagesStructure(batch, limit);
+		reads++;
+		rowsLeft -= rows.length;
+		const byPage = new Map<string, OutlineStructureRow[]>();
+		for (const row of rows) {
+			const list = byPage.get(row.pageId);
+			if (list) list.push(row);
+			else byPage.set(row.pageId, [row]);
+		}
+		// Rows come page by page: when the read was cut, only its last page may be short.
+		const cutPage = truncated ? rows[rows.length - 1]?.pageId : undefined;
+		const again: string[] = [];
+		for (const id of batch) {
+			const rowsOfPage = byPage.get(id);
+			if (rowsOfPage && id !== cutPage) loaded.set(id, rowsOfPage);
+			else if (id === cutPage && byPage.size === 1 && limit === limits.overviewBlocksPerRead) {
+				large.add(id);
+			} else if (truncated) again.push(id);
+			// Otherwise the page has no live blocks any more: left out.
+		}
+		queue = [...again, ...queue.slice(batch.length)];
+	}
+	return { loaded, large, unread: new Set(queue) };
+}
+
 /**
  * `OutlineRead` with address `*`: every space the session may read (its own first, at most
- * {@link OUTLINE_AGENT_READ_LIMITS.overviewSpaces}), each with its pages expanded together,
- * level by level, within the read's budget (`renderOutlineSections`). Facts only by default:
- * tasks are left out, and so are other sessions' notes, which are process as a whole (design
- * §2.1): such a space shows as its line and the number of its pages; view `all` lists them.
+ * {@link OUTLINE_AGENT_READ_LIMITS.overviewSpaces}), each with its pages, expanded together
+ * within the read's budget (`renderOutlineSections`, round-robin across spaces): first the
+ * page lines of every space, then, with what the budget has left, the next level of all of
+ * them, and so on. Facts only by default: tasks are left out, and so are other sessions' notes,
+ * which are process as a whole (design §2.1): such a space shows as its line and the number of
+ * its pages; view `all` lists them.
  *
- * Bounded before the budget: pages are taken only as far as the budget could show them, each
- * page's structure is read up to {@link OUTLINE_AGENT_READ_LIMITS.overviewPageBlocks} blocks (a
- * larger page shows without what is under it) and the overview as a whole up to
- * {@link OUTLINE_AGENT_READ_LIMITS.overviewBlocks}; content is loaded only for what fits. What
- * it shows is a read: recorded in the ledger, links titled where the session may read them.
+ * Bounded: one page list per space (titles only, at most 100 pages); the structure of the pages
+ * the budget could show (round-robin, at most its number of blocks) in a few batched reads
+ * ({@link overviewStructure}); content loaded only for what fits. A page whose structure was not
+ * read shows on its own, and the space says so. What it shows is a read: recorded in the
+ * ledger, links titled where the session may read them.
  */
 async function readAllSpaces(
 	scope: OutlineAgentScope,
@@ -224,110 +303,156 @@ async function readAllSpaces(
 		return { output: OUTLINE_TOOL_TEXT.overviewNotAsOf, isError: true, metadata: meta };
 	}
 	const limits = OUTLINE_AGENT_READ_LIMITS;
-	const { spaces, complete } = await scope.readableSpaces(limits.overviewSpaces);
+	const { spaces, cut } = await scope.readableSpaces(limits.overviewSpaces);
 	if (spaces.length === 0) {
 		return {
 			output: OUTLINE_TOOL_TEXT.allSpacesNone,
 			title: "OutlineRead: *",
-			metadata: { ...meta, spaces: [], complete },
+			metadata: { ...meta, spaces: [], complete: cut === null },
 		};
 	}
 	const view: OutlineView = input.view ?? "facts";
 	const budget = clampBudget(budgetOf(input.budget));
 	const context = await scope.contextSpace();
-	let pagesLeft = budget.blocks;
-	let blocksLeft = limits.overviewBlocks;
-	let taskPages = 0;
-	let cut = !complete;
-	const sections: OutlineRenderSection[] = [];
-	const roots: OutlineNode[] = [];
-	const spaceMeta: Array<Record<string, unknown>> = [];
-	for (const { space, word } of spaces) {
+
+	// 1. Every space's pages, titles only: one statement per space.
+	const plans: OverviewSpace[] = [];
+	for (const [i, { space, word }] of spaces.entries()) {
+		if (i > 0 && i % limits.overviewSpacesPerSlice === 0) await yieldToEventLoop();
 		const own = scope.isOwnSpace(space);
-		const label = scope.labelIn(space);
 		const header = [
 			note(OUTLINE_TOOL_TEXT.spaceSection(await scope.describe(space), space.id === context?.id)),
 		];
+		const plan = { space, word, own, header, listCut: false, taskPages: 0, showable: 0 };
 		if (view === "facts" && space.kind === "session" && !own) {
 			// Another session's notes are process: counted, not listed (metas only, bounded).
 			const max = limits.maxPagesListed;
 			const count = (await scope.store.listChildMetas(space.id, [null], max + 1)).length;
-			const footer = [
-				note(
-					count === 0
-						? OUTLINE_TOOL_TEXT.noPages
-						: OUTLINE_TOOL_TEXT.otherSessionPages(Math.min(count, max), count > max),
-				),
-			];
-			sections.push({ header, roots: [], footer });
-			spaceMeta.push({
-				key: space.key,
-				kind: space.kind,
-				word,
-				own,
-				pages: Math.min(count, max),
-				process: true,
+			plans.push({
+				...plan,
+				pages: [],
+				process: { pages: Math.min(count, max), more: count > max },
 			});
 			continue;
 		}
-		const want = Math.min(limits.maxPagesListed, pagesLeft);
-		const listed = await scope.store.listSpacePages(space.id, { limit: want + 1 });
-		const pages = listed.slice(0, want);
-		pagesLeft -= pages.length;
-		let morePages = listed.length > want;
-		const sectionRoots: OutlineNode[] = [];
-		const alone: string[] = [];
-		for (const page of pages) {
-			if (view === "facts" && page.isTask) {
-				taskPages++;
-				continue;
-			}
-			if (blocksLeft <= 0) {
-				morePages = true;
-				continue;
-			}
-			const structure = await scope.store.listPageStructure(page.id, {
-				asOf: null,
-				limit: Math.min(limits.overviewPageBlocks, blocksLeft),
-			});
-			blocksLeft -= structure.rows.length;
-			if (structure.truncated) {
-				const row = await scope.store.getBlock(page.id);
-				if (!row || row.deleted || row.parentId !== null) continue;
-				sectionRoots.push(pageNode(row));
-				alone.push(label(row.sid));
-				continue;
-			}
-			const root = buildTree(structure.rows).get(page.id);
-			if (root && root.parentId === null) sectionRoots.push(root);
-		}
-		const footer: string[] = [];
-		if (listed.length === 0) footer.push(note(OUTLINE_TOOL_TEXT.noPages));
-		if (alone.length > 0) footer.push(note(OUTLINE_TOOL_TEXT.notExpanded(alone)));
-		if (morePages) footer.push(note(OUTLINE_TOOL_TEXT.morePagesOf(space.key)));
-		cut ||= morePages || alone.length > 0;
-		sections.push({
-			header,
-			roots: sectionRoots,
-			label: (node) => label(node.sid),
-			footer,
+		// Pages that are tasks are listed but take nothing from the budget in the facts view.
+		const max = limits.maxPagesListed;
+		const listed = await scope.store.listSpacePages(space.id, { limit: max + 1 });
+		const taken = listed.slice(0, max);
+		const pages = view === "facts" ? taken.filter((page) => !page.isTask) : taken;
+		plans.push({
+			...plan,
+			pages,
+			listCut: listed.length > max,
+			taskPages: taken.length - pages.length,
 		});
-		roots.push(...sectionRoots);
-		spaceMeta.push({ key: space.key, kind: space.kind, word, own, pages: pages.length });
 	}
 
+	// 2. The pages the budget could show, taken round-robin across spaces as the render takes
+	// them, and their structure.
+	const order: OutlinePageListRow[] = [];
+	for (let i = 0; order.length < budget.blocks; i++) {
+		let more = false;
+		for (const plan of plans) {
+			const page = plan.pages[i];
+			if (!page || order.length >= budget.blocks) continue;
+			order.push(page);
+			plan.showable++;
+			more = true;
+		}
+		if (!more) break;
+	}
+	const { loaded, large, unread } = await overviewStructure(
+		scope,
+		order.map((page) => page.id),
+	);
+
+	// 3. Page trees (a page whose structure was not read, alone), and the sections.
+	const sections: OutlineRenderSection[] = [];
+	const rootsOf = new Map<OverviewSpace, OutlineNode[]>();
+	let truncated = cut !== null;
+	for (const plan of plans) {
+		const { space } = plan;
+		const label = scope.labelIn(space);
+		const shownPages = plan.pages.slice(0, plan.showable);
+		const alone = shownPages.filter((page) => !loaded.has(page.id)).map((page) => page.id);
+		const metas = new Map(
+			alone.length === 0
+				? []
+				: (await scope.store.getBlockMetas(space.id, { ids: alone })).map((m) => [m.id, m]),
+		);
+		const roots: OutlineNode[] = [];
+		const tooLarge: string[] = [];
+		const pastLimit: string[] = [];
+		for (const page of shownPages) {
+			const rows = loaded.get(page.id);
+			if (rows) {
+				const root = buildTree(rows).get(page.id);
+				if (root && root.parentId === null) roots.push(root);
+				continue;
+			}
+			const m = metas.get(page.id);
+			if (!m || m.deleted || m.parentId !== null) continue;
+			roots.push(pageNode(m));
+			if (large.has(page.id)) tooLarge.push(label(m.sid));
+			else if (unread.has(page.id)) pastLimit.push(label(m.sid));
+		}
+		rootsOf.set(plan, roots);
+		const footer: string[] = [];
+		if (plan.process) {
+			footer.push(
+				note(
+					plan.process.pages === 0
+						? OUTLINE_TOOL_TEXT.noPages
+						: OUTLINE_TOOL_TEXT.otherSessionPages(plan.process.pages, plan.process.more),
+				),
+			);
+		} else if (plan.pages.length === 0 && plan.taskPages === 0 && !plan.listCut) {
+			footer.push(note(OUTLINE_TOOL_TEXT.noPages));
+		}
+		if (tooLarge.length > 0) footer.push(note(OUTLINE_TOOL_TEXT.notExpandedLarge(tooLarge)));
+		if (pastLimit.length > 0) footer.push(note(OUTLINE_TOOL_TEXT.notExpandedLimit(pastLimit)));
+		const notTaken = plan.pages.length - plan.showable;
+		truncated ||= plan.listCut || notTaken > 0 || tooLarge.length > 0 || pastLimit.length > 0;
+		sections.push({
+			header: plan.header,
+			roots,
+			label: (node) => label(node.sid),
+			footer,
+			moreTops: (hidden) => {
+				const pages = hidden.roots + notTaken;
+				return pages === 0 && !plan.listCut
+					? null
+					: note(OUTLINE_TOOL_TEXT.morePagesOf(space.key, pages, plan.listCut));
+			},
+		});
+	}
+
+	// 4. Content in the order the render spends the budget, then the render.
 	const state = { current: true, seq: 0 };
-	const order = breadthFirstForest(roots, view, budget.blocks);
-	await loadBodiesWithin(state, order, budget.bytes, { store: scope.store });
+	const loadOrder = sectionsBreadthFirst(sections, {
+		view,
+		interleave: true,
+		limit: budget.blocks,
+	});
+	await loadBodiesWithin(state, loadOrder, budget.bytes, { store: scope.store });
 	const seen = new Map<string, number>();
 	const display = await displayFor(scope, seen)(
 		state,
-		order.filter((node) => node.content !== null),
+		loadOrder.filter((node) => node.content !== null),
 	);
+	const taskPages = plans.reduce((sum, plan) => sum + plan.taskPages, 0);
 	const notes: string[] = [];
 	if (taskPages > 0) notes.push(note(OUTLINE_TOOL_TEXT.taskPagesHidden(taskPages)));
-	if (!complete) notes.push(note(OUTLINE_TOOL_TEXT.moreSpaces));
-	const rendered = renderOutlineSections(sections, { view, budget, display, notes });
+	if (cut === "limit") notes.push(note(OUTLINE_TOOL_TEXT.moreSpaces));
+	if (cut === "candidates") notes.push(note(OUTLINE_TOOL_TEXT.spacesUnchecked));
+	const rendered = renderOutlineSections(sections, {
+		view,
+		budget,
+		display,
+		notes,
+		interleave: true,
+	});
 	recordOutlineReads(
 		scope.narratorId,
 		rendered.blockIds.flatMap((id) => {
@@ -335,19 +460,29 @@ async function readAllSpaces(
 			return version === undefined ? [] : [[id, version] as const];
 		}),
 	);
+	const shownIds = new Set(rendered.blockIds);
 	return {
 		output: `${note(OUTLINE_TOOL_TEXT.allSpacesHeader(spaces.length))}\n${rendered.markdown}`,
 		title: "OutlineRead: *",
 		bounded: true,
 		metadata: {
 			...meta,
-			spaces: spaceMeta,
-			complete,
+			spaces: plans.map((plan) => ({
+				key: plan.space.key,
+				kind: plan.space.kind,
+				word: plan.word,
+				own: plan.own,
+				pages: plan.process
+					? plan.process.pages
+					: (rootsOf.get(plan) ?? []).filter((root) => shownIds.has(root.id)).length,
+				...(plan.process ? { process: true } : {}),
+			})),
+			complete: cut === null,
 			view: rendered.view,
 			blocks: rendered.blockIds.length,
 			hiddenByBudget: rendered.hiddenByBudget,
 			hiddenByView: rendered.hiddenByView + taskPages,
-			truncated: cut || rendered.hiddenByBudget > 0,
+			truncated: truncated || rendered.hiddenByBudget > 0,
 		},
 	};
 }
@@ -445,21 +580,24 @@ function displayFor(scope: OutlineAgentScope, seen: Map<string, number>) {
 }
 
 /**
- * Blocks as a current read shows them, each on its own without children: the short id after
- * the bullet, links with their targets' titles where the session may read them. An edit's
- * result shows the blocks it merged this way, so they can be copied back like a read.
+ * Blocks of `space` as a current read shows them, each on its own without children: the
+ * block's label after the bullet (`[sid]` in an own space, `[key/sid]` elsewhere), links with
+ * their targets' titles where the session may read them. An edit's result shows the blocks it
+ * merged this way, so they can be copied back like a read.
  */
 export async function blockLinesForAgent(
 	scope: OutlineAgentScope,
+	space: OutlineSpaceRow,
 	nodes: readonly OutlineNode[],
 ): Promise<Map<string, string>> {
 	const display = await displayFor(scope, new Map())({ current: true, seq: 0 }, nodes);
+	const label = scope.labelIn(space);
 	const out = new Map<string, string>();
 	for (const node of nodes) {
 		const item = outlineItem(node);
 		out.set(
 			node.id,
-			serializeMarkdownOutline([display?.(node, item) ?? item], { label: () => `[${node.sid}]` }),
+			serializeMarkdownOutline([display?.(node, item) ?? item], { label: () => label(node.sid) }),
 		);
 	}
 	return out;
@@ -579,7 +717,7 @@ export async function outlineSearch(
 	const spaces: OutlineSpaceRow[] = [];
 	const unknown: string[] = [];
 	const ownOnly = !input.spaces || input.spaces.length === 0;
-	let incomplete = false;
+	let cut: "limit" | "candidates" | null = null;
 	const take = (space: OutlineSpaceRow) => {
 		if (!spaces.some((s) => s.id === space.id)) spaces.push(space);
 	};
@@ -590,7 +728,7 @@ export async function outlineSearch(
 				// Every readable space, listed before the search: the set goes into its SQL filter.
 				const all = await scope.readableSpaces(OUTLINE_AGENT_READ_LIMITS.searchAllSpaces);
 				for (const { space } of all.spaces) take(space);
-				incomplete ||= !all.complete;
+				cut = all.cut;
 				continue;
 			}
 			const space = await scope.space(name);
@@ -631,7 +769,8 @@ export async function outlineSearch(
 		described.push(i < OUTLINE_LISTED_NAMES ? await scope.describe(space) : space.key);
 	}
 	const lines = [note(OUTLINE_TOOL_TEXT.searchHeader(hits.length, query, described))];
-	if (incomplete) lines.push(note(OUTLINE_TOOL_TEXT.searchedSome(spaces.length)));
+	if (cut === "limit") lines.push(note(OUTLINE_TOOL_TEXT.searchedSome(spaces.length)));
+	if (cut === "candidates") lines.push(note(OUTLINE_TOOL_TEXT.searchUnchecked));
 	if (unknown.length > 0) lines.push(note(OUTLINE_TOOL_TEXT.spacesNotSearched(unknown)));
 	for (const hit of hits) {
 		const alias = hit.alias ? OUTLINE_TOOL_TEXT.aliasMark(hit.alias) : "";
@@ -662,7 +801,7 @@ export async function outlineSearch(
 			tool: "OutlineSearch",
 			query,
 			spaces: keys,
-			...(incomplete ? { complete: false } : {}),
+			...(cut !== null ? { complete: false } : {}),
 			resultCount: hits.length,
 			results: hits.map((hit) => ({
 				address: hit.address,

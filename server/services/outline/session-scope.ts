@@ -385,24 +385,43 @@ export async function canSessionReadSpace(
 // Listing
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Limits of listing what a session may read (tests lower some of them). */
 export const OUTLINE_SESSION_LIST_LIMITS = {
 	/** Spaces one listing returns at most. */
 	maxSpaces: 200,
 	/**
 	 * Candidates one listing judges, by default: a session read by several people is offered
-	 * every space one of them reads, and only some pass.
+	 * every space one of them might read, and only some pass.
 	 */
-	defaultCandidates: 300,
+	defaultCandidates: 200,
 	/** Candidates one listing may be asked to judge at most. */
 	maxCandidates: 2000,
 	/** Candidate rows one statement reads. */
 	candidatePage: 100,
-} as const;
+	/**
+	 * Candidates judged between two yields to the event loop. A verdict not cached yet costs a
+	 * few to about ten small indexed reads (some tenths of a millisecond on SQLite): measured on
+	 * 320 sessions' spaces none of which a shared session may read, the longest stretch on the
+	 * main thread of a whole overview stays at about 6 to 10 ms.
+	 */
+	judgeSlice: 8,
+};
+
+/** Let pending I/O run: long listings are cut into slices this way. */
+export function yieldToEventLoop(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
 
 export interface SessionReadableSpaces {
 	/** Readable spaces, the session's own first (see {@link listSessionReadableSpaces}). */
 	spaces: OutlineSpaceRow[];
-	/** False when more may be readable than were listed: a limit cut the listing short. */
+	/**
+	 * Why the listing stopped short: `limit` when more spaces are readable than it returns (one
+	 * more was found); `candidates` when it judged as many candidates as it may, so whether any
+	 * of the rest is readable is not known. Null when it is complete.
+	 */
+	cut: "limit" | "candidates" | null;
+	/** `cut === null`. */
 	complete: boolean;
 }
 
@@ -413,7 +432,8 @@ function candidateSource(
 	// Without a main project nothing but the session's own space and personal space is readable.
 	if (state.mainProject === null) return null;
 	if (state.audience.kind !== "people") return { from: { kind: "open" }, kinds: ["project"] };
-	// Any reader will do: the session reads only what all of them read. The owner comes first.
+	// What the session reads, every one of its readers reads: what one of them might read covers
+	// it. The owner comes first.
 	const anchor = state.audience.userIds[0];
 	return {
 		from: anchor === undefined ? { kind: "all" } : { kind: "reader", userId: anchor },
@@ -428,19 +448,82 @@ function clampCount(value: number | undefined, fallback: number, max: number): n
 }
 
 /**
+ * The spaces a listing judges, in its order, each once: the session's own space (its root's),
+ * its main project's, the personal space of the turn's person, then the SQL candidates of other
+ * projects' and other sessions' spaces (`readSpaceCandidatePage`), a page at a time.
+ */
+async function* candidateSpaces(
+	state: ScopeState,
+	executingUserId: string | null,
+): AsyncGenerator<{ space: OutlineSpaceRow; own: boolean }> {
+	if (state.rootNarratorId === null) return;
+	const seen = new Set<string>();
+	const own = [
+		await outlineStore.findSpace({ kind: "session", narratorId: state.rootNarratorId }),
+		state.mainProjectId === null
+			? null
+			: await outlineStore.findSpace({ kind: "project", projectId: state.mainProjectId }),
+		executingUserId
+			? await outlineStore.findSpace({ kind: "personal", ownerUserId: executingUserId })
+			: null,
+	];
+	for (const space of own) {
+		if (!space || seen.has(space.id)) continue;
+		seen.add(space.id);
+		yield { space, own: true };
+	}
+	const source = candidateSource(state);
+	if (source === null) return;
+	const page = OUTLINE_SESSION_LIST_LIMITS.candidatePage;
+	for (const kind of source.kinds) {
+		let afterId: string | undefined;
+		for (;;) {
+			const rows = await readSpaceCandidatePage(source.from, { kind, afterId, limit: page });
+			for (const space of rows) {
+				if (seen.has(space.id)) continue;
+				seen.add(space.id);
+				yield { space, own: false };
+			}
+			const last = rows[rows.length - 1];
+			if (rows.length < page || !last) break;
+			afterId = last.id;
+		}
+	}
+}
+
+/**
+ * The spaces a listing of the session would judge, unjudged, at most `max`: for checks and
+ * tests, which hold them to be a superset of what {@link canSessionReadSpace} admits.
+ */
+export async function listSessionReadCandidates(
+	narratorId: string,
+	options: SessionReadOptions & { max: number },
+): Promise<OutlineSpaceRow[]> {
+	const state = await entryFor(narratorId).state;
+	const out: OutlineSpaceRow[] = [];
+	for await (const { space } of candidateSpaces(state, options.executingUserId ?? null)) {
+		if (out.length >= options.max) break;
+		out.push(space);
+	}
+	return out;
+}
+
+/**
  * The spaces an agent working in the session may read, each judged by
  * {@link canSessionReadSpace}, so nothing is listed that a read by key would refuse. In order:
  * the session's own space (its root's), its main project's, the personal space (for the turn's
  * person), then other projects' spaces, then other sessions' spaces, each kind in id order.
  *
- * Candidates come from SQL, filtered before the LIMIT: the spaces one reader of the session reads
- * (the owner unless an admin) and what is open to every signed-in user; every space when only
- * admins read the session; spaces of projects open to everyone for a public session, one shared
- * by link or one past the reader cap (other sessions' spaces are never readable then).
+ * Candidates come from SQL, filtered before the LIMIT, and always cover what the verdicts admit
+ * (`readSpaceCandidatePage`): what one reader of the session might read (the owner unless an
+ * admin), project spaces open to every signed-in user, and every space when only admins read
+ * the session; for a public session, one shared by link or one past the reader cap, only spaces
+ * of projects open to everyone (other sessions' spaces are never readable then).
  *
- * Bounded: at most `limit` spaces (200) and `maxCandidates` candidates judged (300 by default),
- * a hundred rows per statement; verdicts are cached with the session's scope. `complete` says
- * whether the listing reached the end.
+ * Bounded: at most `limit` spaces (200) and `maxCandidates` candidates judged (200 by default),
+ * a hundred rows per statement; verdicts are cached with the session's scope, and the work
+ * yields to the event loop every {@link OUTLINE_SESSION_LIST_LIMITS.judgeSlice} candidates.
+ * `cut` says why a listing stopped short.
  */
 export async function listSessionReadableSpaces(
 	narratorId: string,
@@ -455,51 +538,21 @@ export async function listSessionReadableSpaces(
 	);
 	const read = { executingUserId: options.executingUserId ?? null };
 	const out: OutlineSpaceRow[] = [];
-	const seen = new Set<string>();
-	const consider = async (space: OutlineSpaceRow | null) => {
-		if (!space || seen.has(space.id)) return;
-		seen.add(space.id);
-		if (await canSessionReadSpace(narratorId, space, read)) out.push(space);
+	const done = (cut: SessionReadableSpaces["cut"]): SessionReadableSpaces => {
+		// One past the limit was found: more are readable, whatever else stopped the listing.
+		const reason = out.length > limit ? "limit" : cut;
+		return { spaces: out.slice(0, limit), cut: reason, complete: reason === null };
 	};
-	const done = (complete: boolean): SessionReadableSpaces => ({
-		spaces: out.slice(0, limit),
-		complete: complete && out.length <= limit,
-	});
-	if (state.rootNarratorId === null) return done(true);
-
-	await consider(
-		await outlineStore.findSpace({ kind: "session", narratorId: state.rootNarratorId }),
-	);
-	if (state.mainProjectId !== null) {
-		await consider(
-			await outlineStore.findSpace({ kind: "project", projectId: state.mainProjectId }),
-		);
-	}
-	if (read.executingUserId) {
-		await consider(
-			await outlineStore.findSpace({ kind: "personal", ownerUserId: read.executingUserId }),
-		);
-	}
-
-	const source = candidateSource(state);
-	if (source === null) return done(true);
-	const page = OUTLINE_SESSION_LIST_LIMITS.candidatePage;
 	let judged = 0;
-	for (const kind of source.kinds) {
-		let afterId: string | undefined;
-		for (;;) {
-			const rows = await readSpaceCandidatePage(source.from, { kind, afterId, limit: page });
-			for (const space of rows) {
-				if (seen.has(space.id)) continue;
-				// One past the limit tells that the listing is not complete.
-				if (out.length > limit || judged >= maxCandidates) return done(false);
-				judged++;
-				await consider(space);
-			}
-			const last = rows[rows.length - 1];
-			if (rows.length < page || !last) break;
-			afterId = last.id;
+	for await (const { space, own } of candidateSpaces(state, read.executingUserId)) {
+		if (out.length > limit) return done("limit");
+		// The session's own spaces come first and do not count against the candidates.
+		if (!own) {
+			if (judged >= maxCandidates) return done("candidates");
+			judged++;
+			if (judged % OUTLINE_SESSION_LIST_LIMITS.judgeSlice === 0) await yieldToEventLoop();
 		}
+		if (await canSessionReadSpace(narratorId, space, read)) out.push(space);
 	}
-	return done(true);
+	return done(null);
 }

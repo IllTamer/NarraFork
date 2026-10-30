@@ -108,12 +108,17 @@ export const OUTLINE_TOOL_TEXT = {
 		'This session can read no outline space yet. OutlineEdit creates its own on the first write: { add: "/", markdown: "- A page" }.',
 	moreSpaces:
 		'this session can read more spaces than the overview lists: read one by its key (key/), or search them all with OutlineSearch { spaces: ["*"] }',
-	morePagesOf: (key: string) =>
-		`more pages than the overview takes; OutlineRead { address: "${key}/" } lists them`,
+	spacesUnchecked:
+		"the overview stops after checking a number of spaces, so a space this session can read may be missing from it: name it by its key (key/) to read it",
+	/** Pages of a space the overview leaves out; never shorter as `n` grows. */
+	morePagesOf: (key: string, n: number, more: boolean) =>
+		`${n === 0 ? "more pages" : `${n}${more ? "+" : ""} more ${n === 1 && !more ? "page" : "pages"}`} not shown; OutlineRead { address: "${key}/" } lists them`,
 	taskPagesHidden: (n: number) =>
 		`facts only: ${n === 1 ? "1 page that is a task" : `${n} pages that are tasks`} not shown; read with view "all" to include them`,
-	notExpanded: (labels: readonly string[]) =>
-		`not expanded in the overview (more blocks than it loads): read ${list(labels)} on their own`,
+	notExpandedLarge: (labels: readonly string[]) =>
+		`shown without what is under them, each has more blocks than one read of the overview takes: read ${list(labels)} on their own`,
+	notExpandedLimit: (labels: readonly string[]) =>
+		`shown without what is under them, past the blocks one overview reads in all: read ${list(labels)} on their own`,
 	overviewNotAsOf:
 		'asOf reads one block as it was; the overview ("*") shows the spaces as they are now. Read a block with asOf instead.',
 	otherSessionPages: (n: number, more: boolean) =>
@@ -138,6 +143,8 @@ export const OUTLINE_TOOL_TEXT = {
 		`${n === 1 ? "1 result" : `${n} results`} for ${quoted(query)} in ${list(spaces)}`,
 	searchedSome: (n: number) =>
 		`searched the first ${n} spaces this session can read; there are more: name them in spaces to search them`,
+	searchUnchecked:
+		"searched the spaces found within what one search checks, so a space this session can read may be missing: name it in spaces to search it",
 	spacesNotSearched: (names: readonly string[]) =>
 		`not searched (no readable space by that name): ${list(names)}`,
 	inPath: (titles: readonly string[]) => `in ${titles.join(" › ")}`,

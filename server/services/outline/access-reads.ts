@@ -34,7 +34,12 @@
 import { type SQL, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { activeDatabaseBackend, db } from "../../db";
-import { bindPlaceholders, narratorReadableText, projectReadableForIdText } from "../read/acl-sql";
+import {
+	bindPlaceholders,
+	narratorReadableText,
+	projectReadableForIdText,
+	projectReadableText,
+} from "../read/acl-sql";
 import type { OutlineSpaceKind } from "./model";
 import { chunked, type OutlineSpaceRow } from "./store/port";
 
@@ -398,8 +403,7 @@ export async function readReadableSpacePage(
 /**
  * Where the spaces a session might read are looked for (`session-scope.ts` judges each one):
  *
- *   - `reader`: what one person reads, by the predicates {@link readReadableSpacePage} uses,
- *     plus what a grant to the `user` role opens (those predicates read user grants only);
+ *   - `reader`: what one reader of the session might read (see {@link readSpaceCandidatePage});
  *   - `open`: project spaces every signed-in user can read (public, or granted to the `user`
  *     role); never a session space;
  *   - `all`: every space of the kind with an owner left (sessions only admins read).
@@ -422,20 +426,56 @@ function openProjectText(projectAlias: string): string {
 	)`;
 }
 
-/** A narrator every signed-in user may read by a grant to the `user` role (past its gate). */
-function roleGrantedNarratorText(narratorIdExpression: string): string {
+/**
+ * The narrator of session space `s` (judged on its root, as every decision about a subagent is),
+ * when the person (every `?`) might read it: `narratorUsersWith` widened so that it never leaves
+ * out a narrator that rule admits. The owner; a public narrator; otherwise past the project gate,
+ * a narrator visible to its project or granted to the person or to the `user` role. The gate
+ * passes a project the person reads or every signed-in user reads (a grant to the `user` role
+ * opens it in the rule, though not in the per-person list predicates), and is taken from the
+ * explicit project only: a project derived from the working directory is not looked at, which
+ * only widens the set.
+ */
+function sessionCandidateText(): string {
 	return `exists (
-		select 1 from acl_grants rg
-		where rg.scope_type = 'narrator' and rg.scope_id = ${narratorIdExpression}
-			and rg.domain_kind is null and rg.principal_type = 'role' and rg.principal_id = 'user'
-			and rg.capability in ('read','write')
+		select 1 from narrators n
+		join narrators jn
+			on jn.id = case when n.type = 'subagent' then n.acl_root_narrator_id else n.id end
+		where n.id = s.narrator_id
+			and (
+				jn.owner_user_id = ?
+				or jn.visibility = 'public'
+				or (
+					not exists (
+						select 1 from projects gp
+						where gp.id = jn.context_project_id
+							and not (${projectReadableText("gp")} or ${openProjectText("gp")})
+					)
+					and (
+						jn.visibility = 'project'
+						or exists (
+							select 1 from acl_grants ng
+							where ng.scope_type = 'narrator' and ng.scope_id = jn.id
+								and ng.domain_kind is null and ng.capability in ('read','write')
+								and (
+									(ng.principal_type = 'user' and ng.principal_id = ?)
+									or (ng.principal_type = 'role' and ng.principal_id = 'user')
+								)
+						)
+					)
+				)
+			)
 	)`;
 }
 
 /**
- * A page of project or session spaces a session might read, in id order after `afterId`:
- * candidates only, a superset of what the session reads (or, where the per-person predicates
- * miss a rule, a little less). The filter runs in SQL, before the LIMIT.
+ * A page of project or session spaces a session might read, in id order after `afterId`. The
+ * filter runs in SQL, before the LIMIT. Candidates only, and always a SUPERSET of what the
+ * verdicts of `session-scope.ts` admit (the access matrix holds it to that): a session reads
+ * only what each of its readers reads, so what one reader (`reader`) might read covers it.
+ *   - project spaces: projects the reader reads by the per-person predicate (owner, public, a
+ *     user grant), and projects every signed-in user reads (a grant to the `user` role);
+ *   - session spaces: {@link sessionCandidateText}.
  */
 export async function readSpaceCandidatePage(
 	from: OutlineSpaceCandidates,
@@ -459,11 +499,7 @@ export async function readSpaceCandidatePage(
 		filter =
 			from.kind === "all"
 				? sql`s.narrator_id is not null`
-				: sql`(exists (
-						select 1 from narrators n
-						where n.id = s.narrator_id
-							and ${bindPlaceholders(narratorReadableText("n"), from.userId)}
-					) or ${sql.raw(roleGrantedNarratorText("s.narrator_id"))})`;
+				: bindPlaceholders(sessionCandidateText(), from.userId);
 	}
 	const rows = await all(sql`
 		select s.id, s.key, s.kind, s.project_id, s.narrator_id, s.owner_user_id, s.next_seq,

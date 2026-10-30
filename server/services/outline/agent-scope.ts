@@ -233,11 +233,14 @@ export class OutlineAgentScope {
 	/**
 	 * Every space the session may read, at most `limit`: its own first (as {@link ownSpaces}
 	 * orders them), then other projects' and other sessions' (`listSessionReadableSpaces`).
-	 * `complete` is false when there are more.
+	 * `cut` says why the list stopped short: `limit`, more are readable; `candidates`, the
+	 * listing judged all it may and cannot tell.
 	 */
-	async readableSpaces(
-		limit: number,
-	): Promise<{ spaces: OutlineReadableSpace[]; complete: boolean }> {
+	async readableSpaces(limit: number): Promise<{
+		spaces: OutlineReadableSpace[];
+		cut: "limit" | "candidates" | null;
+		complete: boolean;
+	}> {
 		const own = await this.ownSpaces();
 		const listed = await listSessionReadableSpaces(this.ctx.narratorId, {
 			executingUserId: this.ctx.userId,
@@ -251,10 +254,8 @@ export class OutlineAgentScope {
 			this.readable.set(space.id, Promise.resolve(true));
 			spaces.push({ space, word: null });
 		}
-		return {
-			spaces: spaces.slice(0, limit),
-			complete: listed.complete && spaces.length <= limit,
-		};
+		const cut = spaces.length > limit ? "limit" : listed.cut;
+		return { spaces: spaces.slice(0, limit), cut, complete: cut === null };
 	}
 
 	/**
@@ -362,10 +363,19 @@ export class OutlineAgentScope {
 		return `${space.key} · ${await this.spaceName(space)}`;
 	}
 
-	/** What a read puts after a block's bullet: its sid in an own space, `key/sid` elsewhere. */
-	labelIn(space: OutlineSpaceRow): (sid: string) => string {
+	/**
+	 * How a block of the space is addressed to the agent: its sid in an own space (where a bare
+	 * id is looked up), `key/sid` in any other.
+	 */
+	addressIn(space: OutlineSpaceRow): (sid: string) => string {
 		const prefix = this.isOwnSpace(space) ? "" : `${space.key}/`;
-		return (sid) => `[${prefix}${sid}]`;
+		return (sid) => `${prefix}${sid}`;
+	}
+
+	/** What a read or an edit's result puts after a block's bullet: `[` its address `]`. */
+	labelIn(space: OutlineSpaceRow): (sid: string) => string {
+		const address = this.addressIn(space);
+		return (sid) => `[${address(sid)}]`;
 	}
 
 	private async spaceName(space: OutlineSpaceRow): Promise<string> {

@@ -15,9 +15,10 @@
  * SECTIONS
  * --------
  * `renderOutlineSections` expands several trees under their own header lines with one budget
- * (the overview of every space an agent may read): all their top-level blocks first, then the
- * next level of all of them. Nothing is forced there but the headers, footers and notes;
- * top-level blocks that do not fit are counted in a `‹… N more›` line at column 0.
+ * (the overview of every space an agent may read): all their top-level blocks first (section by
+ * section, or round-robin), then the next level of all of them. Nothing is forced there but the
+ * headers, footers and notes; top-level blocks that do not fit are counted in a line at column
+ * 0, `‹… N more›` unless the section words it itself.
  *
  * FACTS VIEW
  * ----------
@@ -165,6 +166,7 @@ export function renderOutline(
 		display: options.display,
 		notes,
 		forceFirst: true,
+		interleave: false,
 	});
 }
 
@@ -177,6 +179,12 @@ export interface OutlineRenderSection {
 	label?: OutlineLabel;
 	/** Lines after its blocks, always shown: notes at column 0. */
 	footer?: readonly string[];
+	/**
+	 * The line after its shown top-level blocks saying what of them is left out (`roots` of
+	 * them, `blocks` with what is under them); null for none. A note at column 0; its text must
+	 * not get shorter as the counts grow. Default: `‹… N more›` counting blocks, when any is.
+	 */
+	moreTops?: (hidden: { roots: number; blocks: number }) => string | null;
 }
 
 export interface OutlineSectionsOptions {
@@ -186,14 +194,74 @@ export interface OutlineSectionsOptions {
 	display?: OutlineDisplay;
 	/** Notes at the end, always shown. */
 	notes?: readonly string[];
+	/**
+	 * Take the top level round-robin across sections (every section's first block, then every
+	 * section's second, …) rather than section by section, so that a small budget still shows
+	 * the top of each.
+	 */
+	interleave?: boolean;
+}
+
+/**
+ * The top-level blocks the view shows, in the order a sectioned render takes them, each with
+ * its section.
+ */
+function topOrder(
+	sections: readonly OutlineRenderSection[],
+	view: OutlineView,
+	options: { interleave: boolean; forceFirst: boolean },
+): { tops: OutlineNode[][]; order: Array<{ node: OutlineNode; section: number }> } {
+	const tops = sections.map((section) =>
+		section.roots.filter((root) => options.forceFirst || view === "all" || root.task === null),
+	);
+	const order: Array<{ node: OutlineNode; section: number }> = [];
+	if (options.interleave) {
+		const widest = Math.max(0, ...tops.map((roots) => roots.length));
+		for (let i = 0; i < widest; i++) {
+			tops.forEach((roots, section) => {
+				const node = roots[i];
+				if (node) order.push({ node, section });
+			});
+		}
+	} else {
+		tops.forEach((roots, section) => {
+			for (const node of roots) order.push({ node, section });
+		});
+	}
+	return { tops, order };
+}
+
+/**
+ * The blocks a sectioned render may show, in the order it spends the budget: the top level
+ * (see {@link OutlineSectionsOptions.interleave}), then breadth first, at most `limit`. What
+ * loads content for a render loads it in this order.
+ */
+export function sectionsBreadthFirst(
+	sections: readonly OutlineRenderSection[],
+	options: { view?: OutlineView; interleave?: boolean; limit: number },
+): OutlineNode[] {
+	const view = options.view ?? "facts";
+	const { order } = topOrder(sections, view, {
+		interleave: options.interleave === true,
+		forceFirst: false,
+	});
+	const out = order.map((entry) => entry.node).slice(0, options.limit);
+	for (let i = 0; i < out.length && out.length < options.limit; i++) {
+		for (const child of viewChildren(out[i] as OutlineNode, view)) {
+			if (out.length >= options.limit) break;
+			out.push(child);
+		}
+	}
+	return out.slice(0, Math.max(0, options.limit));
 }
 
 /**
  * Several outlines under their own headers within one budget, expanded together: every
- * section's top-level blocks first, in section order, then the next level of all of them, and
- * so on, the expansion {@link renderOutline} makes of one tree. Nothing is shown regardless of
- * the budget but the headers, footers and notes. Top-level blocks of a section that do not fit
- * are counted in one `‹… N more›` line at column 0 after its shown blocks.
+ * section's top-level blocks first (section by section, or round-robin with `interleave`),
+ * then the next level of all of them, and so on, the expansion {@link renderOutline} makes of
+ * one tree. Nothing is shown regardless of the budget but the headers, footers and notes.
+ * Top-level blocks of a section that do not fit are counted in one line at column 0 after its
+ * shown blocks (see {@link OutlineRenderSection.moreTops}).
  */
 export function renderOutlineSections(
 	sections: readonly OutlineRenderSection[],
@@ -205,8 +273,12 @@ export function renderOutlineSections(
 		display: options.display,
 		notes: options.notes ?? [],
 		forceFirst: false,
+		interleave: options.interleave === true,
 	});
 }
+
+const defaultMoreTops = (hidden: { roots: number; blocks: number }): string | null =>
+	hidden.roots > 0 ? moreLine(0, hidden.blocks) : null;
 
 function expand(
 	sections: readonly OutlineRenderSection[],
@@ -217,6 +289,7 @@ function expand(
 		notes: readonly string[];
 		/** The first top-level block is shown whatever the budget (a read's root). */
 		forceFirst: boolean;
+		interleave: boolean;
 	},
 ): OutlineRenderResult {
 	const { view } = options;
@@ -234,24 +307,20 @@ function expand(
 
 	// The top-level blocks the view shows, then the rest breadth first; their sections, depths,
 	// visible subtree sizes (post-order over the breadth-first list) and what the view leaves out.
+	const { tops, order: topEntries } = topOrder(sections, view, options);
 	let hiddenByView = 0;
-	const tops = sections.map((section) =>
-		section.roots.filter((root) => {
-			if (options.forceFirst || view === "all" || root.task === null) return true;
-			hiddenByView += countSubtree(root);
-			return false;
-		}),
-	);
+	sections.forEach((section, i) => {
+		const kept = new Set(tops[i]);
+		for (const root of section.roots) if (!kept.has(root)) hiddenByView += countSubtree(root);
+	});
 	const order: OutlineNode[] = [];
 	const depth = new Map<OutlineNode, number>();
 	const sectionOf = new Map<OutlineNode, number>();
-	tops.forEach((roots, i) => {
-		for (const root of roots) {
-			depth.set(root, 0);
-			sectionOf.set(root, i);
-			order.push(root);
-		}
-	});
+	for (const { node, section } of topEntries) {
+		depth.set(node, 0);
+		sectionOf.set(node, section);
+		order.push(node);
+	}
 	for (let i = 0; i < order.length; i++) {
 		const node = order[i] as OutlineNode;
 		for (const child of kids(node)) {
@@ -293,12 +362,18 @@ function expand(
 		kids(node).length > 0
 			? utf8(moreLine((depth.get(node) ?? 0) + 1, (size.get(node) ?? 1) - 1)) + 1
 			: 0;
-	/** What the `… more` line after a section's top-level blocks may cost at most. */
-	const topReserve = tops.map((roots) => {
-		let hidden = 0;
-		for (const root of roots) hidden += size.get(root) ?? 0;
-		return hidden > 0 ? utf8(moreLine(0, hidden)) + 1 : 0;
+	const moreTopsOf = (i: number) => sections[i]?.moreTops ?? defaultMoreTops;
+	/**
+	 * What the line after a section's top-level blocks may cost at most (its longest form, all
+	 * of them left out), and whether showing them all makes it go away.
+	 */
+	const topReserve = tops.map((roots, i) => {
+		let blocks = 0;
+		for (const root of roots) blocks += size.get(root) ?? 0;
+		const longest = moreTopsOf(i)({ roots: roots.length, blocks });
+		return longest === null ? 0 : utf8(longest) + 1;
 	});
+	const topLineStays = tops.map((_, i) => moreTopsOf(i)({ roots: 0, blocks: 0 }) !== null);
 
 	let used = linesBytes(notes);
 	for (const section of sections) {
@@ -313,12 +388,16 @@ function expand(
 		if (!forced && (node.content === null || shown.size >= budget.blocks)) break;
 		const parent = node.parent;
 		const section = sectionOf.get(node) ?? 0;
-		const siblings = depth.get(node) === 0 || !parent ? (tops[section] ?? []) : kids(parent);
+		const top = depth.get(node) === 0 || !parent;
+		const siblings = top ? (tops[section] ?? []) : kids(parent);
+		// Under interleaving, a section's last top-level block is still taken after the others.
 		const last = siblings[siblings.length - 1] === node;
 		const release = !last
 			? 0
-			: depth.get(node) === 0 || !parent
-				? (topReserve[section] ?? 0)
+			: top
+				? topLineStays[section]
+					? 0
+					: (topReserve[section] ?? 0)
 				: (reserved.get(parent) ?? 0);
 		const reserve = reserveFor(node);
 		const cost = linesBytes(linesOf(node)) + reserve - release;
@@ -327,7 +406,7 @@ function expand(
 		shown.add(node);
 		reserved.set(node, reserve);
 		if (release > 0) {
-			if (depth.get(node) === 0 || !parent) topReserve[section] = 0;
+			if (top) topReserve[section] = 0;
 			else reserved.set(parent, 0);
 		}
 	}
@@ -337,10 +416,11 @@ function expand(
 	let hiddenByBudget = 0;
 	sections.forEach((section, i) => {
 		out.push(...section.header);
-		let hiddenTops = 0;
+		const hiddenTops = { roots: 0, blocks: 0 };
 		for (const root of tops[i] ?? []) {
 			if (!shown.has(root)) {
-				hiddenTops += size.get(root) ?? 0;
+				hiddenTops.roots++;
+				hiddenTops.blocks += size.get(root) ?? 0;
 				continue;
 			}
 			// Depth-first output; a stack keeps deep outlines off the call stack.
@@ -367,10 +447,9 @@ function expand(
 				for (let k = next.length - 1; k >= 0; k--) stack.push({ node: next[k] as OutlineNode });
 			}
 		}
-		if (hiddenTops > 0) {
-			out.push(moreLine(0, hiddenTops));
-			hiddenByBudget += hiddenTops;
-		}
+		const moreTops = moreTopsOf(i)(hiddenTops);
+		if (moreTops !== null) out.push(moreTops);
+		hiddenByBudget += hiddenTops.blocks;
 		out.push(...(section.footer ?? []));
 	});
 	out.push(...notes);

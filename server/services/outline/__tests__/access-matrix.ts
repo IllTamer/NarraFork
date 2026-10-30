@@ -31,6 +31,7 @@ import {
 	getSessionReadScope,
 	invalidateSessionReadScopes,
 	listSessionReadableSpaces,
+	listSessionReadCandidates,
 	OUTLINE_SESSION_LIST_LIMITS,
 	OUTLINE_SESSION_READER_CAP,
 } from "../session-scope";
@@ -170,6 +171,8 @@ export async function buildAccessWorld(fx: AccessFixtures): Promise<AccessWorld>
 		otherOwnPriv: await session(owner, "private", main),
 		bobPriv: await session(bob, "private", null),
 		adminOwned: await session(admin, "private", main),
+		// Visible to a project only a grant to the `user` role opens: past the gate for everyone.
+		roleOpenVis: await session(carol, "project", projects.roleOpen),
 	};
 	sessions.sub = await fx.narrator({ owner, visibility: "private", subagentOf: sessions.grantA });
 	sessions.subPriv = await fx.narrator({ owner, visibility: "private", subagentOf: sessions.priv });
@@ -199,6 +202,7 @@ export async function buildAccessWorld(fx: AccessFixtures): Promise<AccessWorld>
 		"otherOwnPriv",
 		"bobPriv",
 		"noProject",
+		"roleOpenVis",
 	]) {
 		spaces[`session:${label}`] = await ensureSessionSpace(sessions[label]);
 	}
@@ -716,6 +720,7 @@ function agentCases(world: AccessWorld, cases: AccessCase[]): void {
 			"session:publicVis",
 			"session:shared",
 			"session:noProject",
+			"session:roleOpenVis",
 		],
 	};
 	/** The session whose space a session uses: its root, for a subagent. */
@@ -749,6 +754,21 @@ function agentCases(world: AccessWorld, cases: AccessCase[]): void {
 					ownFirst: !may.get(ownSession) || seen[0] === ownSession,
 					explicit: want === undefined || [...want].sort().join() === [...seen].sort().join(),
 				};
+			},
+		});
+
+		cases.push({
+			group: "listing",
+			label: `${label}: the candidates a listing judges cover every space it may read`,
+			expected: [],
+			actual: async () => {
+				const may = await verdicts(turn);
+				const candidates = await listSessionReadCandidates(sessions[name], {
+					executingUserId: userOf(who),
+					max: 10_000,
+				});
+				const ids = new Set(candidates.map((space) => space.id));
+				return readable(may).filter((l) => !ids.has(spaces[l]?.id as string));
 			},
 		});
 
