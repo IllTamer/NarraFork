@@ -1,5 +1,5 @@
 import type { BrowserContext, CDPSession, Target } from "puppeteer-core";
-import { isOpenedFrom, lineage } from "./tab-scope";
+import { isOpenedFrom, lineage, rememberTargetLineage } from "./tab-scope";
 
 const DIALOG_TIMEOUT_MS = 3_000;
 const MAX_DIALOG_TEXT = 2_000;
@@ -24,6 +24,7 @@ function protectionOf(target: Target): Protection | undefined {
 
 // One browser-level hook, with only weak context lookups: closed sessions must not be retained.
 function onTargetAvailable(target: Target): void {
+	rememberTargetLineage(target);
 	const state = protectionOf(target);
 	if (!state) return;
 	void state.attach(target).catch((error) => {

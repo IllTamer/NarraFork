@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import type { BrowserContext, Target } from "puppeteer-core";
-import { closeTab, isOpenedFrom } from "../tab-scope";
+import { closeTab, isOpenedFrom, rememberTargetLineage } from "../tab-scope";
 
 interface FakeTarget {
 	target: Target;
@@ -50,6 +50,23 @@ describe("tab scope", () => {
 		expect(root.close).toHaveBeenCalledTimes(1);
 		expect(popup.close).toHaveBeenCalledTimes(1);
 		expect(worker.close).not.toHaveBeenCalled();
+		expect(usersTab.close).not.toHaveBeenCalled();
+		expect(close).not.toHaveBeenCalled();
+	});
+
+	test("retains descendants after an intermediate opener disappears", async () => {
+		const root = fakeTarget();
+		const popup = fakeTarget(root);
+		const nested = fakeTarget(popup);
+		const usersTab = fakeTarget();
+		rememberTargetLineage(nested.target);
+		Object.assign(nested.target, { opener: () => undefined });
+		Object.assign(popup.target, { opener: () => undefined });
+		expect(isOpenedFrom(nested.target, root.target)).toBe(true);
+		const { context, close } = fakeContext([root, nested, usersTab], true);
+		await closeTab(context, root.target);
+		expect(root.close).toHaveBeenCalledTimes(1);
+		expect(nested.close).toHaveBeenCalledTimes(1);
 		expect(usersTab.close).not.toHaveBeenCalled();
 		expect(close).not.toHaveBeenCalled();
 	});

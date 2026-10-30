@@ -475,6 +475,50 @@ describe("sessions sharing the default context", () => {
 	);
 
 	chromeTest(
+		"retains popup ownership and protection after an intermediate tab closes",
+		async () => {
+			const context = required(ownedBrowser).defaultBrowserContext();
+			const ours = await sharedPage();
+			const theirs = await sharedPage();
+			const records: string[] = [];
+			const popups: Page[] = [];
+			async function openPopup(opener: Page): Promise<Page> {
+				const pending = new Promise<Page | null>((resolve) => opener.once("popup", resolve));
+				await opener.evaluate(() => window.open("about:blank"));
+				const popup = required(await bounded(pending, "nested popup"));
+				popups.push(popup);
+				return popup;
+			}
+			try {
+				await installDialogProtection(context, (text) => records.push(text), ours.target());
+				const middle = await openPopup(ours);
+				const leaf = await openPopup(middle);
+				await middle.close();
+				expect(leaf.target().opener()).toBeUndefined();
+				const descendant = await openPopup(leaf);
+				expect(
+					await bounded(
+						descendant.evaluate(() => confirm("orphan-descendant")),
+						"dialog",
+					),
+				).toBe(false);
+				await waitFor(
+					() => records.some((text) => text.includes("orphan-descendant")),
+					"descendant dialog protected",
+				);
+				await closeTab(context, ours.target());
+				expect(ours.isClosed()).toBe(true);
+				expect(leaf.isClosed()).toBe(true);
+				expect(descendant.isClosed()).toBe(true);
+				expect(theirs.isClosed()).toBe(false);
+			} finally {
+				await Promise.all([ours, theirs, ...popups].map((page) => page.close().catch(() => {})));
+			}
+		},
+		30_000,
+	);
+
+	chromeTest(
 		"restores a shared-context session by its root tab after reconnect",
 		async () => {
 			const ours = await sharedPage();

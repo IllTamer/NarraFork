@@ -10,9 +10,22 @@ export function isSharedContext(context: BrowserContext): boolean {
 	return context.browser().defaultBrowserContext() === context;
 }
 
-/** target 自身及其 opener 链。 */
+/** Puppeteer 的 opener() 只查存活 target；创建时保留引用，避免中间弹窗关闭后丢失归属。 */
+const openers = new WeakMap<Target, Target>();
+
+/** 必须在新 target 恢复运行前调用，此时 opener 链尚未因 window.close() 断开。 */
+export function rememberTargetLineage(target: Target): void {
+	for (let current: Target | undefined = target; current; ) {
+		const opener: Target | undefined = openers.get(current) ?? current.opener();
+		if (opener) openers.set(current, opener);
+		current = opener;
+	}
+}
+
+/** target 自身及其创建时的 opener 链。弱键使已无后代引用的关闭标签可被回收。 */
 export function* lineage(target: Target): Generator<Target> {
-	for (let current: Target | undefined = target; current; current = current.opener()) {
+	rememberTargetLineage(target);
+	for (let current: Target | undefined = target; current; current = openers.get(current)) {
 		yield current;
 	}
 }
