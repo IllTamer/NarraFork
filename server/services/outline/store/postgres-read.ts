@@ -68,6 +68,21 @@ function toBlock(row: BlockSelect): OutlineBlockRow {
 	};
 }
 
+/** Keys per statement of the reads keyed by block and seq (each key binds a few parameters). */
+const KEYED_CHUNK = 200;
+
+/**
+ * `CASE outline_blocks.id WHEN … THEN … END` (the table named in full: in a select list drizzle
+ * writes a column of the selected table unqualified, which a subquery would read as its own):
+ * a per-block integer (keys never repeat a block).
+ */
+function caseOf(pairs: ReadonlyArray<readonly [string, number]>): SQL {
+	return sql`CASE outline_blocks.id ${sql.join(
+		pairs.map(([id, n]) => sql`WHEN CAST(${id} AS text) THEN CAST(${n} AS integer)`),
+		sql` `,
+	)} END`;
+}
+
 function toVersion(row: VersionSelect): OutlineVersionRow {
 	return { ...row, taskJson: taskOf(row.taskJson) };
 }
@@ -187,19 +202,70 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 			return out;
 		},
 
-		async listVersionsByKey(keys) {
+		async listVersionsAtSeqs(keys) {
 			const out: OutlineVersionRow[] = [];
-			for (const chunk of chunked(keys, VERSION_KEY_CHUNK)) {
+			const v = outlineBlockVersions;
+			for (const chunk of chunked(keys, KEYED_CHUNK)) {
+				const seqOf = new Map(chunk.map((k) => [k.blockId, k.seq]));
+				const at = caseOf(chunk.map((k) => [k.blockId, k.seq]));
+				// The latest version that opened by each seq, then those rows by exact key.
+				const found = (
+					await db
+						.select({
+							blockId: outlineBlocks.id,
+							fromSeq: sql<number | null>`(SELECT v.from_seq FROM outline_block_versions v
+								WHERE v.block_id = outline_blocks.id AND v.from_seq <= ${at}
+								ORDER BY v.from_seq DESC LIMIT 1)`,
+						})
+						.from(outlineBlocks)
+						.where(inArray(outlineBlocks.id, [...seqOf.keys()]))
+				).filter((r): r is { blockId: string; fromSeq: number } => r.fromSeq !== null);
+				if (found.length === 0) continue;
 				const pairs = sql.join(
-					chunk.map((k) => sql`(CAST(${k.blockId} AS text), CAST(${k.fromSeq} AS integer))`),
+					found.map(
+						(k) => sql`(CAST(${k.blockId} AS text), CAST(${Number(k.fromSeq)} AS integer))`,
+					),
 					sql`, `,
 				);
-				const v = outlineBlockVersions;
 				const rows = await db
 					.select()
 					.from(v)
 					.where(sql`(${v.blockId}, ${v.fromSeq}) IN (VALUES ${pairs})`);
-				for (const row of rows) out.push(toVersion(row));
+				for (const row of rows) {
+					const seq = seqOf.get(row.blockId) as number;
+					if (row.toSeq === null || row.toSeq > seq) out.push(toVersion(row));
+				}
+			}
+			return out;
+		},
+
+		async findLastWrites(keys, except) {
+			const out: Array<{ blockId: string; fromSeq: number }> = [];
+			const significant = ~except.flags & 0x7fffffff;
+			for (const chunk of chunked(keys, KEYED_CHUNK)) {
+				const after = caseOf(chunk.map((k) => [k.blockId, k.afterSeq]));
+				const rows = await db
+					.select({
+						blockId: outlineBlocks.id,
+						fromSeq: sql<number | null>`(SELECT v.from_seq FROM outline_block_versions v
+							JOIN outline_commits c ON c.id = v.commit_id
+							WHERE v.block_id = outline_blocks.id AND v.from_seq > ${after}
+								AND NOT (c.actor_kind = CAST(${except.actorKind} AS text)
+									AND c.actor_id = CAST(${except.actorId} AS text)
+									AND (v.change_flags & CAST(${significant} AS integer)) = 0)
+							ORDER BY v.from_seq DESC LIMIT 1)`,
+					})
+					.from(outlineBlocks)
+					.where(
+						inArray(
+							outlineBlocks.id,
+							chunk.map((k) => k.blockId),
+						),
+					);
+				for (const row of rows) {
+					if (row.fromSeq !== null)
+						out.push({ blockId: row.blockId, fromSeq: Number(row.fromSeq) });
+				}
 			}
 			return out;
 		},

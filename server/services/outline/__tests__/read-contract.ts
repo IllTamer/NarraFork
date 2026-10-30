@@ -536,7 +536,7 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
-		name: "versions by key; a merged update says so on its version and reverts like any",
+		name: "versions at seqs; a merged update says so on its version and reverts like any",
 		async run(ctx) {
 			const space = await personalSpace(ctx);
 			const created = await write(ctx, space, [
@@ -560,20 +560,19 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 			const s5 = (await write(ctx, space, [{ op: "delete", block: { id } }])).commit?.seq as number;
 			expect((await ctx.store.getBlock(id))?.content).toBe("v2");
 
-			// Exact keys only; unknown ones are left out, in any number.
-			const keys = [s1, s2, s3, s4, s5].map((fromSeq) => ({ blockId: id, fromSeq }));
-			const unknown = Array.from({ length: 300 }, (_, i) => ({
-				blockId: `missing-${i}`,
-				fromSeq: s1,
-			}));
-			const versions = await ctx.store.listVersionsByKey([
-				...keys,
-				{ blockId: id, fromSeq: s5 + 1 },
-				...unknown,
-			]);
-			const at = new Map(versions.map((v) => [v.fromSeq, v]));
-			expect([...at.keys()].sort((x, y) => x - y)).toEqual([s1, s2, s3, s4, s5]);
-			expect(versions.every((v) => v.blockId === id)).toBe(true);
+			// The version valid at each seq: exact, in between, tombstone, before the block existed.
+			const other = a0(await write(ctx, space, [{ op: "insert", parent: null, content: "other" }]));
+			const atSeq = async (seq: number) =>
+				(await ctx.store.listVersionsAtSeqs([{ blockId: id, seq }]))[0];
+			expect(await atSeq(s1 - 1)).toBeUndefined();
+			const at = new Map<number, OutlineVersionRow>();
+			for (const seq of [s1, s2, s3, s4, s5]) {
+				const v = await atSeq(seq);
+				expect(v?.fromSeq).toBe(seq);
+				at.set(seq, v as OutlineVersionRow);
+			}
+			const later = (await ctx.store.getSpace(space.id))?.nextSeq as number;
+			expect((await atSeq(later + 10))?.fromSeq).toBe(s5);
 			expect(at.get(s1)).toMatchObject({
 				toSeq: s2,
 				content: "v1",
@@ -583,6 +582,18 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 				commitId: created.commit?.id,
 			});
 			expect(at.get(s5)).toMatchObject({ content: null, deleted: true, toSeq: null });
+			// Many keys at once, unknown blocks left out.
+			const many = await ctx.store.listVersionsAtSeqs([
+				{ blockId: id, seq: s3 },
+				{ blockId: other, seq: later },
+				...Array.from({ length: 300 }, (_, i) => ({ blockId: `missing-${i}`, seq: s1 })),
+			]);
+			expect(many.map((v) => [v.blockId, v.fromSeq]).sort()).toEqual(
+				[
+					[id, s3],
+					[other, later - 1],
+				].sort(),
+			);
 			const isMerge = (seq: number) =>
 				((at.get(seq)?.changeFlags ?? 0) & OUTLINE_CHANGE.MERGE) !== 0;
 			expect([s1, s2, s3, s4, s5].map(isMerge)).toEqual([false, false, true, false, false]);
@@ -591,6 +602,78 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 			const dump = await ctx.dump(space.id);
 			checkSpaceInvariants(dump);
 			checkChangeFlags(dump);
+		},
+	},
+	{
+		name: "last writes: the latest version that counts, leaving out an actor's own or its moves",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const agent = { kind: "agent" as const, id: "agent-last-writes" };
+			const pages = ids(
+				await write(ctx, space, [
+					{ op: "insert", tempId: "a", parent: null, content: "page A" },
+					{ op: "insert", tempId: "b", parent: null, content: "page B" },
+					{ op: "insert", tempId: "x", parent: { tempId: "a" }, content: "x by a person" },
+				]),
+			);
+			const [pageA, pageB, x] = pages as [string, string, string];
+			const s1 = (await ctx.store.getBlock(x))?.versionSeq as number;
+			const seq = async (ops: OutlineOp[], actor: OutlineWriteInput["actor"] = agent) =>
+				(await write(ctx, space, ops, { actor })).commit?.seq as number;
+			const s2 = await seq([{ op: "update", block: { id: x }, content: "x by the agent" }]);
+			const s3 = await seq([{ op: "move", block: { id: x }, parent: { id: pageB } }]);
+			const s4 = await seq(
+				[{ op: "update", block: { id: x }, content: "x by a person again" }],
+				ACTOR,
+			);
+			const s5 = await seq([{ op: "move", block: { id: x }, parent: { id: pageA } }]);
+			expect(new Set([s1, s2, s3, s4, s5]).size).toBe(5);
+			const ALL = 0x7fffffff;
+			const MOVES = OUTLINE_CHANGE.MOVE | OUTLINE_CHANGE.PAGE;
+			const last = async (afterSeq: number, flags: number, actorId = agent.id) =>
+				(
+					await ctx.store.findLastWrites([{ blockId: x, afterSeq }], {
+						actorKind: "agent",
+						actorId,
+						flags,
+					})
+				)[0]?.fromSeq;
+			// Someone else's latest version after a seq; none after the person's last one.
+			expect(await last(s1, ALL)).toBe(s4);
+			expect(await last(0, ALL)).toBe(s4);
+			expect(await last(s4, ALL)).toBeUndefined();
+			// Leaving out only the agent's moves: the person's edit under the agent's later move.
+			expect(await last(0, MOVES)).toBe(s4);
+			expect(await last(s4, MOVES)).toBeUndefined();
+			expect(await last(s2, MOVES, "someone-else")).toBe(s5);
+			// The agent's own content write counts when only moves are left out.
+			const own = a0(
+				await write(ctx, space, [{ op: "insert", parent: null, content: "by the agent" }], {
+					actor: agent,
+				}),
+			);
+			const ownSeq = (await ctx.store.getBlock(own))?.versionSeq as number;
+			const both = await ctx.store.findLastWrites(
+				[
+					{ blockId: x, afterSeq: 0 },
+					{ blockId: own, afterSeq: 0 },
+					...Array.from({ length: 300 }, (_, i) => ({ blockId: `missing-${i}`, afterSeq: 0 })),
+				],
+				{ actorKind: "agent", actorId: agent.id, flags: MOVES },
+			);
+			expect(both.map((r) => [r.blockId, r.fromSeq]).sort()).toEqual(
+				[
+					[x, s4],
+					[own, ownSeq],
+				].sort(),
+			);
+			expect(
+				await ctx.store.findLastWrites([{ blockId: own, afterSeq: 0 }], {
+					actorKind: "agent",
+					actorId: agent.id,
+					flags: ALL,
+				}),
+			).toEqual([]);
 		},
 	},
 	{

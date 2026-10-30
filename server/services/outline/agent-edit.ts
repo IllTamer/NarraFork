@@ -47,7 +47,12 @@ import {
 	parseAliasValue,
 	TASK_BOX,
 } from "@shared/outline";
-import { type AgentMerge, type AgentReplace, mergeAgentReplaces } from "./agent-merge";
+import {
+	type AgentMerge,
+	AgentMergeLimitError,
+	type AgentReplace,
+	mergeAgentReplaces,
+} from "./agent-merge";
 import { blockLinesForAgent, type OutlineToolOutput } from "./agent-read";
 import {
 	type OutlineAgentScope,
@@ -67,7 +72,7 @@ import { newOutlineSid } from "./keys";
 import { linkDisplayTitle } from "./link-display";
 import { withOutlineLiveBarrier } from "./live-barrier";
 import { OUTLINE_TOOL_TEXT } from "./messages";
-import { OUTLINE_LIMITS } from "./model";
+import { OUTLINE_CHANGE, OUTLINE_LIMITS } from "./model";
 import { forgetOutlineReads, recordOutlineReads, seenOutlineVersion } from "./read-ledger";
 import type { OutlineResolvedBlock } from "./resolve";
 import type {
@@ -141,6 +146,15 @@ export const OUTLINE_EDIT_LIMITS = {
 	/** UTF-8 bytes of conflicting blocks' current text a result shows in full (see below). */
 	maxConflictShownBytes: 32 * 1024,
 } as const;
+
+/** Change flags that leave out every version of an actor (`findLastWrites`). */
+const ALL_CHANGES = 0x7fffffff;
+/**
+ * Change flags of the agent's own versions that leave the text as it was (moves, page changes,
+ * checkbox and properties): they do not tell that it knows the text, and are left out.
+ */
+const OWN_NOT_TEXT =
+	OUTLINE_CHANGE.MOVE | OUTLINE_CHANGE.PAGE | OUTLINE_CHANGE.TASK | OUTLINE_CHANGE.PROPS;
 
 const STATUS_OF: Record<Exclude<OutlineCheckbox, "none">, OutlineTaskInput["status"]> = {
 	" ": "todo",
@@ -718,39 +732,76 @@ export async function outlineEdit(
 				deleted,
 				OUTLINE_EDIT_LIMITS.maxDeletedChecked,
 			);
-			// Blocks someone may have written since the agent read them (or never read).
-			const unsure = (m: OutlineBlockMeta) => {
+			// Who wrote what the agent is changing or deleting, since it read it: any version after
+			// its read by someone else (its own versions left out: a move of its own writes a page
+			// change for every block under the moved one, which says nothing about what others
+			// wrote). A block it never read (or not since a restart): the latest version that is not
+			// one of its own leaving the text as it was (a move, a set), by someone else.
+			const replacedOrDeleted = (blockId: string) =>
+				(editsOf.get(blockId) ?? []).some((e) => e.kind === "replace" || e.kind === "delete");
+			const candidates = new Map<string, OutlineBlockMeta>();
+			for (const m of current.values()) candidates.set(m.id, m);
+			for (const b of under.blocks)
+				if (!candidates.has(b.meta.id)) candidates.set(b.meta.id, b.meta);
+			const checkedSinceRead: Array<{ blockId: string; afterSeq: number }> = [];
+			const checkedUnread: Array<{ blockId: string; afterSeq: number }> = [];
+			for (const m of candidates.values()) {
 				const seen = seenOf(m.id);
-				return seen === undefined || m.versionSeq > seen;
-			};
-			const suspects = [...current.values(), ...under.blocks.map((b) => b.meta)].filter(unsure);
-			const commits = new Map(
-				suspects.length === 0
+				if (seen !== undefined) {
+					if (m.versionSeq > seen) checkedSinceRead.push({ blockId: m.id, afterSeq: seen });
+				} else if (!current.has(m.id) || replacedOrDeleted(m.id)) {
+					checkedUnread.push({ blockId: m.id, afterSeq: 0 });
+				}
+			}
+			const self = { actorKind: "agent" as const, actorId: scope.narratorId };
+			const byOthersSince = new Map(
+				checkedSinceRead.length === 0
 					? []
 					: (
-							await scope.store.getCommitsBySeqs(space.id, [
-								...new Set(suspects.map((m) => m.versionSeq)),
-							])
-						).map((c) => [c.seq, c]),
+							await scope.store.findLastWrites(checkedSinceRead, { ...self, flags: ALL_CHANGES })
+						).map((r) => [r.blockId, r.fromSeq]),
 			);
-			const byOther = (m: OutlineBlockMeta) => {
-				const commit = commits.get(m.versionSeq);
-				return !(commit?.actorKind === "agent" && commit.actorId === scope.narratorId);
+			const lastWrite = new Map(
+				checkedUnread.length === 0
+					? []
+					: (await scope.store.findLastWrites(checkedUnread, { ...self, flags: OWN_NOT_TEXT })).map(
+							(r) => [r.blockId, r.fromSeq],
+						),
+			);
+			const commits = new Map(
+				(
+					await scope.store.getCommitsBySeqs(space.id, [
+						...new Set([...byOthersSince.values(), ...lastWrite.values()]),
+					])
+				).map((c) => [c.seq, c]),
+			);
+			const isOwn = (seq: number) => {
+				const commit = commits.get(seq);
+				return commit?.actorKind === "agent" && commit.actorId === scope.narratorId;
+			};
+			/** The version by someone else that the agent has not seen, if there is one. */
+			const unseenWrite = (blockId: string): number | undefined => {
+				const since = byOthersSince.get(blockId);
+				if (since !== undefined) return since;
+				const last = lastWrite.get(blockId);
+				return last !== undefined && !isOwn(last) ? last : undefined;
 			};
 			const why = (
 				m: OutlineBlockMeta,
+				seq: number,
 				extra: Partial<ChangedSinceRead> = {},
 			): ChangedSinceRead => ({
 				blockId: m.id,
 				sid: m.sid,
 				seen: seenOf(m.id) ?? null,
-				now: m.versionSeq,
-				by: commits.get(m.versionSeq),
+				now: seq,
+				by: commits.get(seq),
 				...extra,
 			});
-			const changed = [...current.values()]
-				.filter((m) => seenOf(m.id) !== undefined && unsure(m) && byOther(m))
-				.map((m) => why(m));
+			const changed = [...current.values()].flatMap((m) => {
+				const seq = byOthersSince.get(m.id);
+				return seq === undefined ? [] : [why(m, seq)];
+			});
 			// Only a block's one replace is merged; a move, delete or set needs the block as read.
 			const replaceOf = (blockId: string) => {
 				const list = editsOf.get(blockId) ?? [];
@@ -758,18 +809,18 @@ export async function outlineEdit(
 			};
 			// Never read (or not since the server started): a replace or delete of what someone
 			// else wrote needs a read first (design §6.5, the read cache gone: any change refuses).
-			const rewrites = (blockId: string) =>
-				(editsOf.get(blockId) ?? []).some((e) => e.kind === "replace" || e.kind === "delete");
-			const unread = [...current.values()]
-				.filter((m) => seenOf(m.id) === undefined && byOther(m) && rewrites(m.id))
-				.map((m) => why(m, { shown: true }));
+			const unread = [...current.values()].flatMap((m) => {
+				const seq = seenOf(m.id) === undefined ? unseenWrite(m.id) : undefined;
+				return seq === undefined ? [] : [why(m, seq, { shown: true })];
+			});
 			const sidOf = (id: string) => current.get(id)?.sid ?? id;
-			const underChanged = under.blocks
-				.filter((b) => unsure(b.meta) && byOther(b.meta))
-				.map((b) => why(b.meta, { under: sidOf(b.rootId), shown: true }));
-			const tooLarge = under.overflow.flatMap((id) => {
-				const m = current.get(id);
-				return m ? [why(m, { tooLarge: true })] : [];
+			const underChanged = under.blocks.flatMap((b) => {
+				const seq = unseenWrite(b.meta.id);
+				return seq === undefined ? [] : [why(b.meta, seq, { under: sidOf(b.rootId), shown: true })];
+			});
+			const tooLarge = under.overflow.flatMap(({ rootId, limit }) => {
+				const m = current.get(rootId);
+				return m ? [why(m, m.versionSeq, { tooLarge: limit })] : [];
 			});
 			// Each block once (one deleted under another is both a target and under it).
 			const refusedNow = new Map<string, ChangedSinceRead>();
@@ -800,13 +851,28 @@ export async function outlineEdit(
 						...replaceFields(p),
 					};
 				});
+				// What the rest of the call writes, so the merged texts are checked against what one
+				// transaction takes before any of them is merged (the merges hold the space's lane).
+				const mergedIds = new Set(changed.map((c) => c.blockId));
+				let otherBytes = 0;
+				for (const edit of edits) {
+					const own = edit.located?.kind === "block" ? edit.located.block.id : undefined;
+					(edit.items ?? []).forEach((p, k) => {
+						walkPlanned([p], (q) => {
+							if (!(k === 0 && q === p && own && mergedIds.has(own)))
+								otherBytes += Buffer.byteLength(q.content, "utf8");
+						});
+					});
+				}
 				let results: AgentMerge[];
 				try {
 					results = await mergeAgentReplaces(scope.store, replaces, {
 						signal: provenance.signal,
+						maxTheirsBytes: OUTLINE_LIMITS.maxTransactionBodyBytes - otherBytes,
 					});
 				} catch (error) {
-					if (error instanceof OutlineEditTextError) return { output: failed([error.message]) };
+					if (error instanceof OutlineEditTextError || error instanceof AgentMergeLimitError)
+						return { output: failed([error.message]) };
 					throw error;
 				}
 				const refused: ChangedSinceRead[] = [];
@@ -991,37 +1057,44 @@ export async function outlineEdit(
 				throw error;
 			}
 
-			// The read ledger follows the agent's own writes.
+			// The read ledger follows the agent's own writes: what it added and the texts it wrote.
+			// A merged block counts as read only once the result shows it (below), so until then
+			// it keeps the version the agent read and a later edit merges again. A set or a move
+			// shows nothing of the block: it only moves a version the agent did read along.
 			const commit = result.commit;
 			if (commit) {
 				const written: Array<readonly [string, number]> = [];
 				const deleted: string[] = [];
 				result.results.forEach((r, i) => {
 					if (!r) return;
-					if (ops[i]?.op === "delete") deleted.push(r.blockId);
-					else written.push([r.blockId, commit.seq]);
+					const op = ops[i];
+					const kind = edits[opEdit[i] as number]?.kind;
+					if (op?.op === "delete") deleted.push(r.blockId);
+					else if (merges.has(r.blockId) && op?.op !== "insert") {
+						// Shown (or not) below.
+					} else if (kind === "set" || kind === "move") {
+						if (seenOf(r.blockId) !== undefined) written.push([r.blockId, commit.seq]);
+					} else written.push([r.blockId, commit.seq]);
 					for (const s of r.split) written.push([s.blockId, commit.seq]);
 				});
 				recordOutlineReads(scope.narratorId, written);
 				forgetOutlineReads(scope.narratorId, deleted);
 			}
 
-			// Merged blocks as they are now (still behind the barrier: nobody has typed since).
-			// The result shows them, so the ledger records these versions as read.
+			// Merged blocks as they are now (still behind the barrier: nobody has typed since), in
+			// the order of the call's edits.
 			const merged: MergedBlock[] = [];
 			if (merges.size > 0) {
 				const ids = [...merges.keys()];
-				const rows = await scope.store.getBlocks(ids);
+				const rows = new Map((await scope.store.getBlocks(ids)).map((row) => [row.id, row]));
 				const tags = await tagsNow(scope, ids);
-				for (const row of rows) {
-					const why = merges.get(row.id)?.why;
-					if (!why || row.deleted) continue;
+				for (const edit of edits) {
+					if (edit.kind !== "replace" || edit.located?.kind !== "block") continue;
+					const row = rows.get(edit.located.block.id);
+					const why = row ? merges.get(row.id)?.why : undefined;
+					if (!row || !why || row.deleted) continue;
 					merged.push({ why, row, tags: tags.get(row.id) ?? [] });
 				}
-				recordOutlineReads(
-					scope.narratorId,
-					merged.map((m) => [m.row.id, m.row.versionSeq] as const),
-				);
 			}
 			return { written: result, merged };
 		});
@@ -1038,7 +1111,7 @@ export async function outlineEdit(
 			spaceText,
 			edits,
 			outcome.written,
-			await mergedSection(scope, outcome.merged),
+			await mergedSection(scope, outcome.merged, scope.narratorId),
 			{ globalNotes, hints, meta },
 		);
 	}
@@ -1085,8 +1158,8 @@ interface ChangedSinceRead {
 	detail?: string[];
 	/** The sid of the block this call deletes that it is under. */
 	under?: string;
-	/** A block this call deletes with more blocks under it than are checked. */
-	tooLarge?: boolean;
+	/** A block this call deletes with more blocks under it than were left to check: that many. */
+	tooLarge?: number;
 	/**
 	 * Its current text is shown in full (within a budget) and then counts as read, so the edit
 	 * goes through once the agent has seen it: a block never read, or under a deleted one.
@@ -1095,26 +1168,33 @@ interface ChangedSinceRead {
 }
 
 /**
- * Live descendants of `rootIds`, breadth first, each with the root it is under, at most `max`:
- * one indexed, bounded query per level. Roots whose subtree does not fit are `overflow` (with
- * every root not reached).
+ * Live descendants of `rootIds`, breadth first, each with the root it is under, at most `max`
+ * for all roots together: one indexed, bounded query per level. A root whose subtree does not
+ * fit in what is left is `overflow`, with the number of blocks that was left for it (its blocks
+ * are not counted; the roots after it still are).
  */
 async function liveDescendants(
 	store: OutlineStore,
 	spaceId: string,
 	rootIds: readonly string[],
 	max: number,
-): Promise<{ blocks: Array<{ meta: OutlineBlockMeta; rootId: string }>; overflow: string[] }> {
+): Promise<{
+	blocks: Array<{ meta: OutlineBlockMeta; rootId: string }>;
+	overflow: Array<{ rootId: string; limit: number }>;
+}> {
 	const blocks: Array<{ meta: OutlineBlockMeta; rootId: string }> = [];
-	const overflow: string[] = [];
-	for (const [k, rootId] of rootIds.entries()) {
+	const overflow: Array<{ rootId: string; limit: number }> = [];
+	for (const rootId of rootIds) {
+		const start = blocks.length;
+		const limit = max - start;
 		let frontier = [rootId];
 		while (frontier.length > 0) {
 			const remaining = max - blocks.length;
 			const rows = await store.listChildMetas(spaceId, frontier, remaining + 1);
 			if (rows.length > remaining) {
-				overflow.push(...rootIds.slice(k));
-				return { blocks, overflow };
+				blocks.length = start;
+				overflow.push({ rootId, limit });
+				break;
 			}
 			for (const meta of rows) blocks.push({ meta, rootId });
 			frontier = rows.map((m) => m.id);
@@ -1162,6 +1242,8 @@ async function tagsNow(
 interface MergedSection {
 	lines: string[];
 	sids: ReadonlySet<string>;
+	/** Those whose merged text it shows (the rest the agent has to read). */
+	shown: ReadonlySet<string>;
 }
 
 /** A block merged by this call, as it is after the write. */
@@ -1237,8 +1319,10 @@ async function conflictOutput(
 	let needsRead = conflicts.length > listed.length;
 	for (const c of listed) {
 		const who = whoChanged(c.by);
-		if (c.tooLarge) {
-			lines.push(`- ${text.tooLargeToDelete(c.sid, OUTLINE_EDIT_LIMITS.maxDeletedChecked)}`);
+		if (c.tooLarge !== undefined) {
+			lines.push(
+				`- ${text.tooLargeToDelete(c.sid, c.tooLarge, OUTLINE_EDIT_LIMITS.maxDeletedChecked)}`,
+			);
 			continue;
 		}
 		lines.push(
@@ -1256,7 +1340,8 @@ async function conflictOutput(
 	}
 	if (conflicts.length > listed.length)
 		lines.push(text.moreConflicts(conflicts.length - listed.length));
-	if (conflicts.some((c) => c.seen === null && !c.tooLarge)) lines.push(text.readFirst);
+	if (conflicts.some((c) => c.seen === null && c.tooLarge === undefined))
+		lines.push(text.readFirst);
 	if (shown.length > 0) {
 		lines.push(text.shownHeader);
 		for (const row of shown) lines.push(rendered.get(row.id) ?? "");
@@ -1291,14 +1376,16 @@ function itemLines(items: readonly PlannedItem[], depth: number, out: string[]):
 async function mergedSection(
 	scope: OutlineAgentScope,
 	merged: readonly MergedBlock[],
+	narratorId: string,
 ): Promise<MergedSection> {
-	if (merged.length === 0) return { lines: [], sids: new Set() };
+	if (merged.length === 0) return { lines: [], sids: new Set(), shown: new Set() };
 	const rendered = await blockLinesForAgent(
 		scope,
 		merged.map((m) => rowNode(m.row, m.tags)),
 	);
 	const lines: string[] = [OUTLINE_TOOL_TEXT.edit.mergedHeader];
 	const unshown: string[] = [];
+	const shown: MergedBlock[] = [];
 	let bytes = 0;
 	for (const m of merged) {
 		const text = rendered.get(m.row.id) ?? "";
@@ -1308,6 +1395,7 @@ async function mergedSection(
 			continue;
 		}
 		bytes += size;
+		shown.push(m);
 		const { why } = m;
 		lines.push(
 			`‹${OUTLINE_TOOL_TEXT.edit.mergedBlock(why.sid, whoChanged(why.by), why.now, why.seen ?? 0)}›`,
@@ -1315,7 +1403,17 @@ async function mergedSection(
 		lines.push(text);
 	}
 	if (unshown.length > 0) lines.push(`‹${OUTLINE_TOOL_TEXT.edit.mergedNotShown(unshown)}›`);
-	return { lines, sids: new Set(merged.map((m) => m.row.sid)) };
+	// Shown whole, as a read shows them: these versions count as read. The others keep the
+	// version the agent read, so its next edit of them is merged again.
+	recordOutlineReads(
+		narratorId,
+		shown.map((m) => [m.row.id, m.row.versionSeq] as const),
+	);
+	return {
+		lines,
+		sids: new Set(merged.map((m) => m.row.sid)),
+		shown: new Set(shown.map((m) => m.row.sid)),
+	};
 }
 
 function successOutput(
@@ -1351,7 +1449,13 @@ function successOutput(
 		} else if ("replace" in r) {
 			const sid = firstResult?.sid ?? "";
 			lines.push(
-				`${n}. ${merged.sids.has(sid) ? OUTLINE_TOOL_TEXT.edit.replacedMerged(sid) : OUTLINE_TOOL_TEXT.edit.replaced(sid)}`,
+				`${n}. ${
+					merged.shown.has(sid)
+						? OUTLINE_TOOL_TEXT.edit.replacedMerged(sid)
+						: merged.sids.has(sid)
+							? OUTLINE_TOOL_TEXT.edit.replacedMergedUnshown(sid)
+							: OUTLINE_TOOL_TEXT.edit.replaced(sid)
+				}`,
 			);
 			const children = (edit.items?.[0]?.children ?? []) as PlannedItem[];
 			if (children.length > 0) itemLines(children, 1, lines);

@@ -25,8 +25,13 @@ import {
 	type EditTextOverlap,
 	editTextJobBytes,
 } from "./edit-text";
-import { processEditText } from "./edit-text-runner";
+import {
+	OUTLINE_EDIT_TEXT_LIMITS,
+	OutlineEditTextError,
+	processEditText,
+} from "./edit-text-runner";
 import { type ExtractedLink, linkKey, tagLinks } from "./links";
+import { OUTLINE_TOOL_TEXT } from "./messages";
 import { OUTLINE_LIMITS, type OutlineTaskJson } from "./model";
 import type { OutlineBlockRow, OutlineStore, OutlineVersionRow } from "./store/port";
 import type { OutlineTaskPatch } from "./write";
@@ -220,13 +225,32 @@ async function tagsAt(
 async function mergeTexts(
 	inputs: readonly EditTextMergeInput[],
 	signal: AbortSignal | undefined,
+	deadline: number,
 ): Promise<EditTextMerged[]> {
 	const out: EditTextMerged[] = [];
 	let batch: EditTextMergeInput[] = [];
 	let bytes = 0;
 	const run = async () => {
 		if (batch.length === 0) return;
-		out.push(...(await processEditText({ kind: "merge", merges: batch }, { signal })));
+		const left = deadline - Date.now();
+		if (left <= 0)
+			throw new AgentMergeLimitError(
+				OUTLINE_TOOL_TEXT.edit.mergeTooSlow(AGENT_MERGE_LIMITS.timeMs),
+			);
+		try {
+			out.push(
+				...(await processEditText(
+					{ kind: "merge", merges: batch },
+					{ signal, timeoutMs: Math.min(left, OUTLINE_EDIT_TEXT_LIMITS.timeoutMs) },
+				)),
+			);
+		} catch (error) {
+			if (error instanceof OutlineEditTextError && error.code === "OUTLINE_TEXT_TIMEOUT")
+				throw new AgentMergeLimitError(
+					OUTLINE_TOOL_TEXT.edit.mergeTooSlow(AGENT_MERGE_LIMITS.timeMs),
+				);
+			throw error;
+		}
 		batch = [];
 		bytes = 0;
 	};
@@ -240,23 +264,59 @@ async function mergeTexts(
 	return out;
 }
 
+/** Bounds of one call's merges, which run while the space's lane is held. */
+export const AGENT_MERGE_LIMITS = {
+	/** All the merges of one call: past this the call is refused, nothing written. */
+	timeMs: 5_000,
+};
+
+/** The merges of one call would take too much (text or time); nothing was written. */
+export class AgentMergeLimitError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "AgentMergeLimitError";
+	}
+}
+
 /**
- * Merge each replace onto its block as it is now. One result per replace, in order. Throws what
- * the text runner throws (`OutlineEditTextError`: busy, timed out, cancelled).
+ * Merge each replace onto its block as it is now. One result per replace, in order.
+ *
+ * Bounded before any merge: each new text at most `OUTLINE_LIMITS.maxBodyBytes`, the blocks'
+ * current texts together at most `maxTheirsBytes` (what one transaction may carry besides the
+ * call's other text); and all merges together within {@link AGENT_MERGE_LIMITS.timeMs}. Past
+ * either it throws {@link AgentMergeLimitError}. Throws what the text runner throws otherwise
+ * (`OutlineEditTextError`: busy, cancelled).
  */
 export async function mergeAgentReplaces(
 	store: OutlineStore,
 	replaces: readonly AgentReplace[],
-	options: { signal?: AbortSignal } = {},
+	options: { signal?: AbortSignal; maxTheirsBytes?: number } = {},
 ): Promise<AgentMerge[]> {
 	if (replaces.length === 0) return [];
+	const deadline = Date.now() + AGENT_MERGE_LIMITS.timeMs;
+	for (const r of replaces) {
+		const bytes = Buffer.byteLength(r.content, "utf8");
+		if (bytes > OUTLINE_LIMITS.maxBodyBytes)
+			throw new AgentMergeLimitError(
+				OUTLINE_TOOL_TEXT.edit.mergeBodyTooLarge(bytes, OUTLINE_LIMITS.maxBodyBytes),
+			);
+	}
 	const ids = replaces.map((r) => r.blockId);
+	// The version valid when the agent read (a block its own commit left unchanged was recorded
+	// at that commit's seq, after the version's own).
 	const bases = new Map(
 		(
-			await store.listVersionsByKey(replaces.map((r) => ({ blockId: r.blockId, fromSeq: r.seen })))
-		).map((v) => [`${v.blockId}\u0000${v.fromSeq}`, v]),
+			await store.listVersionsAtSeqs(replaces.map((r) => ({ blockId: r.blockId, seq: r.seen })))
+		).map((v) => [v.blockId, v]),
 	);
 	const rows = new Map((await store.getBlocks(ids)).map((b) => [b.id, b]));
+	const maxTheirs = options.maxTheirsBytes ?? OUTLINE_LIMITS.maxTransactionBodyBytes;
+	let theirsBytes = 0;
+	for (const row of rows.values()) theirsBytes += Buffer.byteLength(row.content, "utf8");
+	if (theirsBytes > maxTheirs)
+		throw new AgentMergeLimitError(
+			OUTLINE_TOOL_TEXT.edit.mergeTooLarge(theirsBytes, Math.max(0, maxTheirs)),
+		);
 	const tagged = replaces.filter((r) => r.tags !== undefined);
 	const tagsNow =
 		tagged.length > 0
@@ -276,7 +336,7 @@ export async function mergeAgentReplaces(
 	const results: Array<AgentMerge | undefined> = [];
 	const texts: Array<{ index: number; input: EditTextMergeInput; fields: FieldPlan }> = [];
 	for (const [index, replace] of replaces.entries()) {
-		const base = bases.get(`${replace.blockId}\u0000${replace.seen}`);
+		const base = bases.get(replace.blockId);
 		const now = rows.get(replace.blockId);
 		const refuse = (reason: AgentMergeRefusal, fields?: AgentMergeField[]) => {
 			results[index] = {
@@ -316,6 +376,7 @@ export async function mergeAgentReplaces(
 	const merged = await mergeTexts(
 		texts.map((t) => t.input),
 		options.signal,
+		deadline,
 	);
 	texts.forEach(({ index, input, fields }, k) => {
 		const replace = replaces[index] as AgentReplace;

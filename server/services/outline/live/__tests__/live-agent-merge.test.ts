@@ -248,6 +248,55 @@ describe("an agent writing into a page being typed in", () => {
 		});
 	});
 
+	test("an emoji and Chinese text: the merge reaches the live text whole", async () => {
+		const { pageId, pageSid, blocks } = await page([
+			"Build status 🔴 today",
+			"这是重点内容。",
+			"家人 👨‍👩‍👧 合影",
+		]);
+		const [status, zh, family] = blocks as Array<{ id: string; sid: string }>;
+		await outlineReadTool.execute({ address: pageSid }, agent());
+		const alice = open(owner);
+		const bob = open(writer);
+		const a = alice.page(pageId);
+		const b = bob.page(pageId);
+		await waitFor(() => a.ready && b.ready, 3000, "joined");
+		await settle();
+		type(a, status.id, "!");
+		type(a, zh.id, "明天继续。");
+		type(b, family.id, " 🎉");
+		await settle();
+		const result = await edit([
+			// 🔴 → 🟢 share their first UTF-16 half: the live patch must not split it.
+			{ replace: status.sid, text: "Build status 🟢 today" },
+			{ replace: zh.sid, text: "这是要点内容。" },
+			{ replace: family.sid, text: "家人 👨‍👩‍👦 合影" },
+		]);
+		expect(result.isError).toBeUndefined();
+		await settle(40);
+		const want = {
+			[status.id]: "Build status 🟢 today!",
+			[zh.id]: "这是要点内容。明天继续。",
+			[family.id]: "家人 👨‍👩‍👦 合影 🎉",
+		};
+		for (const [id, text] of Object.entries(want)) {
+			expect(await everywhere([a, b], pageId, id)).toEqual({
+				clients: [text],
+				session: text,
+				stored: text,
+			});
+		}
+		// Typing on keeps every character whole, in the session and once committed.
+		type(a, status.id, "?");
+		await settle();
+		expect(await everywhere([a, b], pageId, status.id)).toEqual({
+			clients: ["Build status 🟢 today!?"],
+			session: "Build status 🟢 today!?",
+			stored: "Build status 🟢 today!?",
+		});
+		for (const id of Object.keys(want)) expect(await content(id)).not.toContain("\uFFFD");
+	});
+
 	test("keystrokes still on their way when the agent writes land after its merge", async () => {
 		const { pageId, pageSid, blocks } = await page(["alpha beta gamma"]);
 		const block = blocks[0] as { id: string; sid: string };

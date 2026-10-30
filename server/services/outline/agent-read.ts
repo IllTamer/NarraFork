@@ -104,10 +104,7 @@ async function pageLines(
 	const limit = OUTLINE_AGENT_READ_LIMITS.maxPagesListed;
 	const rows = await scope.store.listChildren(space.id, null, limit + 1);
 	const pages = rows.slice(0, limit);
-	recordOutlineReads(
-		scope.narratorId,
-		pages.map((page) => [page.id, page.versionSeq] as const),
-	);
+	// Only titles, clipped: not a read of the pages (their edits need one).
 	const lines = pages.map((page) => {
 		const box = page.taskJson ? `[${TASK_BOX[page.taskJson.status]}] ` : "";
 		return `- [${page.sid}] ${box}${clip(blockTitle(page.content)) || OUTLINE_TOOL_TEXT.untitled}`;

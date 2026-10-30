@@ -10,7 +10,12 @@
  *
  * This file imports nothing dialect-specific.
  */
-import type { OutlineLinkKind, OutlineLinkTargetKind, OutlineTaskJson } from "../model";
+import type {
+	OutlineActorKind,
+	OutlineLinkKind,
+	OutlineLinkTargetKind,
+	OutlineTaskJson,
+} from "../model";
 import type { OutlineBlockRow, OutlineCommitRow, OutlineLinkRow, OutlineVersionRow } from "./port";
 
 /** A live block of a page at some seq, without its content: what the tree is built from. */
@@ -108,12 +113,24 @@ export interface OutlineReadPort {
 		keys: ReadonlyArray<{ blockId: string; fromSeq: number }>,
 	): Promise<Array<{ blockId: string; fromSeq: number; content: string | null }>>;
 	/**
-	 * Whole versions by exact key (`block_id`, `from_seq`), one primary-key lookup each: the
-	 * version an agent read, which its edit is merged from. Keys with no version are left out.
+	 * The whole version of each block valid at its own seq (`from_seq <= seq < to_seq`, or open):
+	 * the version an agent read, which its edit is merged from. Blocks with no version then are
+	 * left out. Each key is one backward seek on the primary key (`block_id`, `from_seq`).
 	 */
-	listVersionsByKey(
-		keys: ReadonlyArray<{ blockId: string; fromSeq: number }>,
+	listVersionsAtSeqs(
+		keys: ReadonlyArray<{ blockId: string; seq: number }>,
 	): Promise<OutlineVersionRow[]>;
+	/**
+	 * For each block, the `from_seq` of its latest version after `afterSeq` that counts: all of
+	 * them except `except.actor`'s versions whose change flags lie within `except.flags` (every
+	 * flag: none of the actor's versions count; a move's flags: its moves and page changes do
+	 * not). Blocks with none are left out. Each block is one backward scan of its versions on the
+	 * primary key, joined to their commits by id, that stops at the first version that counts.
+	 */
+	findLastWrites(
+		keys: ReadonlyArray<{ blockId: string; afterSeq: number }>,
+		except: { actorKind: OutlineActorKind; actorId: string; flags: number },
+	): Promise<Array<{ blockId: string; fromSeq: number }>>;
 	/** Links of the given blocks and kinds valid at `seq` (`null`: open links), at most `limit`. */
 	listLinksAt(
 		blockIds: readonly string[],
