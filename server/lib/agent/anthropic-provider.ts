@@ -60,6 +60,7 @@ import {
 	readResponsePrefix,
 	sanitizeHeaders,
 } from "./request-dump";
+import { stringifyRequestBody } from "./request-json";
 import { parseJsonResponseWithBody } from "./response-body";
 import type { StreamProgress } from "./stream-progress";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
@@ -1909,7 +1910,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		});
 
 		await reportInputCharacters(params, body);
-		const bodyStr = JSON.stringify(body);
+		const bodyStr = await stringifyRequestBody(body, params.signal);
 
 		params.onRequestStart?.();
 		const response = await this.fetchWithV1Fallback(
@@ -2007,7 +2008,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			{
 				method: "POST",
 				headers,
-				body: JSON.stringify(body),
+				body: await stringifyRequestBody(body, options?.signal),
 				signal: options?.signal,
 			},
 		);
@@ -2103,7 +2104,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			{
 				method: "POST",
 				headers: genHeaders,
-				body: JSON.stringify(body),
+				body: await stringifyRequestBody(body, options?.signal),
 				signal: options?.signal,
 			},
 		);
@@ -2185,7 +2186,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			{
 				method: "POST",
 				headers,
-				body: JSON.stringify(body),
+				body: await stringifyRequestBody(body, params.signal),
 				signal: params.signal,
 			},
 		);
@@ -2971,7 +2972,13 @@ function anthropicWireHistory(
 					});
 				} else if (item.text) {
 					history.push({
-						role: item.role === "sys" && options.midConversationSystem ? "system" : "user",
+						// Typed updates use the existing user carrier even on the native path:
+						// ensureAlternating would move a system entry past later user input.
+						// The frozen baseline explicitly grants named-part replacement semantics.
+						role:
+							item.role === "sys" && options.midConversationSystem && !item.contextUpdate
+								? "system"
+								: "user",
 						content: item.text,
 					});
 				}

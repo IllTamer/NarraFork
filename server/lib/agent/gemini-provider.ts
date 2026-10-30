@@ -30,6 +30,7 @@ import {
 } from "./provider-model-metadata";
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { stringifyRequestBody } from "./request-json";
 import { parseJsonTextWithBody } from "./response-body";
 import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -329,8 +330,7 @@ export class GeminiProvider implements ProviderAdapter {
 		});
 
 		await reportInputCharacters(params, body);
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, params.signal);
 		params.requestDump?.beginResponseAttempt({
 			transport: "http",
 			method: "POST",
@@ -472,8 +472,7 @@ export class GeminiProvider implements ProviderAdapter {
 				...(maxOutputTokens !== undefined && { maxOutputTokens }),
 			};
 
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, opts.signal);
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 		const response = await this.pfetch(url, {
 			method: "POST",

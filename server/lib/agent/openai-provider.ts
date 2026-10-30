@@ -60,6 +60,7 @@ import {
 } from "./provider-model-metadata";
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { createRequestBodyEncoder, stringifyRequestBody } from "./request-json";
 import { parseJsonTextWithBody } from "./response-body";
 import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import type { ToolLoadingChange, ToolLoadingTarget } from "./tool-loading";
@@ -245,7 +246,10 @@ export function appendCodexNativeTools(
 		removeNativeTool(tools, "image_generation");
 		return;
 	}
-	if (!supportsCodexImageGeneration(model)) return;
+	if (!supportsCodexImageGeneration(model)) {
+		removeNativeTool(tools, "image_generation");
+		return;
+	}
 	if (!hasNativeTool(tools, "image_generation")) {
 		tools.push({
 			type: "image_generation",
@@ -255,6 +259,31 @@ export function appendCodexNativeTools(
 		return;
 	}
 	applyCodexImageGenerationDefaults(tools);
+}
+
+/**
+ * Hosted capability revocation is an explicit prefix exception: this Codex adapter
+ * has no verified execution allow-list separate from its declarations. Remove a
+ * disabled hosted tool even when that changes the prefix; never mutate epoch tools.
+ */
+export function withCodexNativeTools(
+	baseline: readonly unknown[],
+	model: string,
+	options: { webSearch?: boolean; imageGeneration?: boolean },
+): unknown[] {
+	const tools = baseline.map((tool) => {
+		if (!tool || typeof tool !== "object") return tool;
+		const type = (tool as { type?: string }).type;
+		return type === "web_search" || type === "image_generation" ? { ...tool } : tool;
+	});
+	appendCodexNativeTools(tools, model, options);
+	logger.debug("Codex native capability policy may change the cached prefix", {
+		protocol: "codex-responses",
+		prefixException: "native-capability-policy",
+		webSearch: hasNativeTool(tools, "web_search"),
+		imageGeneration: hasNativeTool(tools, "image_generation"),
+	});
+	return tools;
 }
 
 /** Declared catalog tiers constrain requests; unknown models keep the selected effort. */
@@ -802,14 +831,12 @@ export class OpenAIProvider implements ProviderAdapter {
 
 			// Codex: inject native server-side tools only when the selected model supports them.
 			if (this.apiMode === "codex") {
-				const toolsArr = (body.tools ?? []) as unknown[];
-				appendCodexNativeTools(toolsArr, params.model, {
+				body.tools = withCodexNativeTools(tools, params.model, {
 					webSearch:
 						this.codexWebSearchEnabled &&
 						isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
 					imageGeneration: this.codexImageGenerationEnabled,
 				});
-				body.tools = toolsArr;
 			}
 
 			const normalizedCodexReasoningEffort =
@@ -880,12 +907,13 @@ export class OpenAIProvider implements ProviderAdapter {
 		// (observed: NUG Responses relays refusing `max_output_tokens`). Only safe
 		// before any stream event has been yielded — after that the consumer has
 		// already seen partial output and a silent re-send would duplicate it.
+		const encodeBody = createRequestBodyEncoder();
 		for (let attempt = 0; ; attempt++) {
 			if (turnState && this.apiMode === "codex") {
 				requestHeaders["x-codex-turn-state"] = turnState;
 			}
 			await reportInputCharacters(params, body);
-			const bodyText = JSON.stringify(body);
+			const bodyText = await encodeBody(body, params.signal);
 			params.requestDump?.beginResponseAttempt({
 				transport: "http",
 				method: "POST",
@@ -1198,7 +1226,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
 			headers,
-			body: JSON.stringify(body),
+			body: await stringifyRequestBody(body, signal),
 			signal,
 		});
 		// Capture the turn's sticky-routing token before status handling so even
@@ -1277,7 +1305,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
-			body: JSON.stringify(body),
+			body: await stringifyRequestBody(body, signal),
 			signal,
 		});
 
@@ -1558,8 +1586,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		if (!instructions) markRuntimeInstructions(request);
-		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		appendCodexNativeTools(tools, params.model, {
+		const tools = withCodexNativeTools(params.tools, params.model, {
 			webSearch:
 				this.codexWebSearchEnabled &&
 				isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
