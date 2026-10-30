@@ -36,6 +36,7 @@ import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { activeDatabaseBackend, db } from "../../db";
 import {
 	bindPlaceholders,
+	narratorProjectIdText,
 	narratorReadableText,
 	projectReadableForIdText,
 	projectReadableText,
@@ -432,11 +433,15 @@ function openProjectText(projectAlias: string): string {
  * out a narrator that rule admits. The owner; a public narrator; otherwise past the project gate,
  * a narrator visible to its project or granted to the person or to the `user` role. The gate
  * passes a project the person reads or every signed-in user reads (a grant to the `user` role
- * opens it in the rule, though not in the per-person list predicates), and is taken from the
- * explicit project only: a project derived from the working directory is not looked at, which
- * only widens the set.
+ * opens it in the rule, though not in the per-person list predicates).
+ *
+ * The gate's project is the one `resolveNarratorProjectId` gives on each backend
+ * (`gateProject`): on SQLite the explicit project, else the primary working-directory link
+ * (`narratorProjectIdText`), so sessions filed under someone's private project by their working
+ * directory, the usual way, are not offered to everyone; on PostgreSQL, which knows only the
+ * explicit project so far, that one alone.
  */
-function sessionCandidateText(): string {
+function sessionCandidateText(gateProject: string): string {
 	return `exists (
 		select 1 from narrators n
 		join narrators jn
@@ -448,7 +453,7 @@ function sessionCandidateText(): string {
 				or (
 					not exists (
 						select 1 from projects gp
-						where gp.id = jn.context_project_id
+						where gp.id = ${gateProject}
 							and not (${projectReadableText("gp")} or ${openProjectText("gp")})
 					)
 					and (
@@ -499,7 +504,10 @@ export async function readSpaceCandidatePage(
 		filter =
 			from.kind === "all"
 				? sql`s.narrator_id is not null`
-				: bindPlaceholders(sessionCandidateText(), from.userId);
+				: bindPlaceholders(
+						sessionCandidateText(pg ? "jn.context_project_id" : narratorProjectIdText("jn")),
+						from.userId,
+					);
 	}
 	const rows = await all(sql`
 		select s.id, s.key, s.kind, s.project_id, s.narrator_id, s.owner_user_id, s.next_seq,

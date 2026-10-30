@@ -113,6 +113,16 @@ function postgresFixtures(pg: BunSQLDatabase): AccessFixtures {
 		async deleteUser(id) {
 			await pg.delete(pgSchema.users).where(eq(pgSchema.users.id, id));
 		},
+		async linkProject(narratorId, projectId) {
+			await pg.insert(pgSchema.narratorProjectLinks).values({
+				narratorId,
+				projectId,
+				role: "primary",
+				source: "cwd",
+				directory: `/tmp/${narratorId}`,
+				updatedAt: NOW,
+			});
+		},
 	};
 }
 

@@ -19,6 +19,7 @@ import {
 	outlineSearchTool,
 } from "../../../lib/agent/tools/outline";
 import type { ToolContext, ToolDefinition, ToolResult } from "../../../lib/agent/types";
+import { eventBus } from "../../../lib/event-bus";
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import { OUTLINE_AGENT_READ_LIMITS } from "../agent-read";
@@ -507,6 +508,29 @@ describe("the overview of every readable space", () => {
 		}
 	});
 
+	test("the overview lets other work run between its stretches of work", async () => {
+		const owner = await user("solo");
+		const main = await project(owner, "Main");
+		const session = await narrator(owner, main);
+		const space = await ensureProjectSpace(main);
+		await write(space, owner, [{ op: "insert", parent: null, content: "A page" }]);
+		let ticks = 0;
+		let running = true;
+		const tick = () => {
+			ticks++;
+			if (running) setImmediate(tick);
+		};
+		setImmediate(tick);
+		try {
+			const r = await call(outlineReadTool, { address: "*" }, ctx(session, owner));
+			expect(r.output).toContain("A page");
+		} finally {
+			running = false;
+		}
+		// Content, links and the render each start after a yield.
+		expect(ticks).toBeGreaterThanOrEqual(3);
+	});
+
 	test("a session that can read nothing yet", async () => {
 		const owner = await user("solo");
 		const session = await narrator(owner, null);
@@ -844,5 +868,179 @@ describe("limits of what one listing looks at", () => {
 			running = false;
 			Object.assign(lists, saved);
 		}
+	});
+});
+
+describe("access that changes while the outline is read", () => {
+	/** Alice's session in Main, and three projects only she reads, each with a secret. */
+	async function setup() {
+		const alice = await user("alice");
+		const bob = await user("bob");
+		const main = await project(alice, "Main");
+		const mainSpace = await ensureProjectSpace(main);
+		await write(mainSpace, alice, [{ op: "insert", parent: null, content: "Shared Numbat plan" }]);
+		const session = await narrator(alice, main);
+		const secrets: OutlineSpaceRow[] = [];
+		for (let i = 0; i < 3; i++) {
+			const space = await ensureProjectSpace(await project(alice, `Secret ${i}`));
+			await write(space, alice, [{ op: "insert", parent: null, content: `Numbat secret ${i}` }]);
+			secrets.push(space);
+		}
+		const grants = [
+			{ scopeType: "project" as const, scopeId: main },
+			{ scopeType: "narrator" as const, scopeId: session },
+		];
+		/** Share the session with Bob (who reads Main only), or stop sharing it. */
+		const share = async (on: boolean) => {
+			for (const g of grants) {
+				if (on) {
+					await db.insert(aclGrants).values({
+						id: generateId(),
+						...g,
+						principalType: "user",
+						principalId: bob,
+						capability: "read",
+						createdAt: NOW,
+					});
+				} else {
+					await db.delete(aclGrants).where(eq(aclGrants.scopeId, g.scopeId));
+				}
+			}
+			eventBus.emit({ type: "narrator:access_changed", narratorId: session } as never);
+		};
+		return { alice, session, secrets, share, mainSpace };
+	}
+
+	/**
+	 * Run `fn` with `method` of the store calling `onCall(n)` before its call number `n` (only the
+	 * calls `counts` admits are counted and hooked).
+	 */
+	async function patched<T>(
+		method: "listSpacePages" | "searchBlocks",
+		onCall: (n: number) => Promise<void>,
+		fn: () => Promise<T>,
+		counts: (args: unknown[]) => boolean = () => true,
+	): Promise<T> {
+		const store = outlineStore as unknown as Record<string, (...args: unknown[]) => unknown>;
+		const original = store[method] as (...args: unknown[]) => unknown;
+		let n = 0;
+		store[method] = async (...args) => {
+			if (counts(args)) await onCall(n++);
+			return await original.apply(outlineStore, args);
+		};
+		try {
+			return await fn();
+		} finally {
+			store[method] = original;
+		}
+	}
+
+	test("the overview started before the session was shared shows nothing its new reader may not", async () => {
+		const w = await setup();
+		const c = ctx(w.session, w.alice);
+		const before = await call(outlineReadTool, { address: "*" }, c);
+		expect(before.output).toContain("Numbat secret 0");
+		clearOutlineReads();
+		const r = await patched(
+			"listSpacePages",
+			async (n) => {
+				if (n === 0) await w.share(true);
+			},
+			() => call(outlineReadTool, { address: "*" }, c),
+		);
+		expect(r.isError).toBeUndefined();
+		expect(r.output).toContain("Shared Numbat plan");
+		expect(r.output).not.toContain("Numbat secret");
+		const keys = (r.metadata?.spaces as Array<{ key: string }>).map((s) => s.key);
+		for (const secret of w.secrets) expect(keys).not.toContain(secret.key);
+		// What the first, dropped answer read is not taken as read.
+		const secretBlock = (
+			await db
+				.select()
+				.from(outlineBlocks)
+				.where(eq(outlineBlocks.spaceId, w.secrets[0]?.id as string))
+		)[0];
+		expect(seenOutlineVersion(w.session, secretBlock?.id as string)).toBeUndefined();
+	});
+
+	test("a search of every space started before the change shows nothing it may not", async () => {
+		const w = await setup();
+		const c = ctx(w.session, w.alice);
+		const r = await patched(
+			"searchBlocks",
+			async (n) => {
+				if (n === 0) await w.share(true);
+			},
+			() => call(outlineSearchTool, { query: "Numbat", spaces: ["*"] }, c),
+		);
+		expect(r.output).toContain("Shared Numbat plan");
+		expect(r.output).not.toContain("Numbat secret");
+	});
+
+	test("when access keeps changing, nothing that is not readable now is shown", async () => {
+		const w = await setup();
+		const c = ctx(w.session, w.alice);
+		// Shared, unshared, shared again: each answer is built under access that then changes. The
+		// last one, built unshared, shows the secrets; shared now, the session may not read them.
+		const r = await patched(
+			"listSpacePages",
+			async (n) => {
+				if (n === 0 || n === 2) await w.share(true);
+				if (n === 1) await w.share(false);
+			},
+			() => call(outlineReadTool, { address: "*" }, c),
+			(args) => args[0] === w.mainSpace.id,
+		);
+		expect(r.isError).toBe(true);
+		expect(r.output).toBe(OUTLINE_TOOL_TEXT.accessChanged);
+		// Unshared at once and changed (for nothing) after every answer: the last answer still
+		// holds when it is checked, so it is given.
+		const settledLast = await patched(
+			"listSpacePages",
+			async () => {
+				await w.share(false);
+			},
+			() => call(outlineReadTool, { address: "*" }, c),
+			(args) => args[0] === w.mainSpace.id,
+		);
+		expect(settledLast.isError).toBeUndefined();
+		expect(settledLast.output).toContain("Numbat secret 0");
+	});
+});
+
+describe("candidates of both kinds", () => {
+	test("project candidates the session may not read do not crowd out readable session spaces", async () => {
+		const alice = await user("alice");
+		const bob = await user("bob");
+		const main = await project(alice, "Main");
+		const session = await narrator(alice, main);
+		await ensureProjectSpace(main);
+		const grant = (scopeType: "project" | "narrator", scopeId: string) =>
+			db.insert(aclGrants).values({
+				id: generateId(),
+				scopeType,
+				scopeId,
+				principalType: "user",
+				principalId: bob,
+				capability: "read",
+				createdAt: NOW,
+			});
+		await grant("project", main);
+		await grant("narrator", session);
+		// Ten projects only Alice reads, and a session of Main both of them read.
+		for (let i = 0; i < 10; i++) await ensureProjectSpace(await project(alice, `Alice ${i}`));
+		const team = await narrator(alice, main, { visibility: "project", title: "Team notes" });
+		const teamSpace = await ensureSessionSpace(team);
+		invalidateSessionReadScopes();
+		const listed = await listSessionReadableSpaces(session, {
+			executingUserId: alice,
+			limit: 200,
+			maxCandidates: 6,
+		});
+		expect(listed.cut).toBe("candidates");
+		expect(listed.spaces.map((s) => s.id)).toContain(teamSpace.id);
+		// Listed by kind all the same: projects before sessions.
+		const kinds = listed.spaces.slice(1).map((s) => s.kind);
+		expect(kinds.indexOf("session")).toBeGreaterThan(kinds.lastIndexOf("project"));
 	});
 });

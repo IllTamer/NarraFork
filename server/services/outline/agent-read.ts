@@ -25,7 +25,9 @@
  * them all (`OutlineSearch` with spaces `["*"]`; the readable set goes into the SQL filter before
  * the result limit). A space it may not read is never named, listed or searched, and a reference
  * into one gets exactly the answer a reference to nothing gets. Reads of other spaces are
- * recorded in the read ledger like any other.
+ * recorded in the read ledger like any other. The overview and searches span several turns of
+ * the event loop: an access change meanwhile makes them start again (`stableAnswer`), so they
+ * never show what the session may no longer read.
  *
  * The output is bounded by the read's budget, so the agent loop must not cut it again (its cut
  * keeps the tail and would lose the top of the outline).
@@ -47,7 +49,7 @@ import {
 } from "./render";
 import type { OutlineResolvedBlock } from "./resolve";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "./search";
-import { yieldToEventLoop } from "./session-scope";
+import { sessionScopeEpoch, yieldToEventLoop } from "./session-scope";
 import type { OutlineBlockMeta, OutlineSpaceRow } from "./store/port";
 import type { OutlinePageListRow, OutlineStructureRow } from "./store/read-port";
 import { buildTree, type OutlineNode, type OutlineView } from "./tree";
@@ -279,6 +281,55 @@ async function overviewStructure(
 	return { loaded, large, unread: new Set(queue) };
 }
 
+/** An answer built from what the session may read, before it is given. */
+interface ScopedAnswer {
+	output: OutlineToolOutput;
+	/** Block versions it shows, for the read ledger. */
+	reads: ReadonlyArray<readonly [string, number]>;
+	/** Spaces whose content it shows. */
+	spaces: readonly OutlineSpaceRow[];
+}
+
+/** Times an answer is built again when access changes while it is built. */
+const ACCESS_ATTEMPTS = 3;
+
+/**
+ * Build an answer that spans several turns of the event loop (the overview, a search of every
+ * space) and give it only if no access change dropped cached verdicts meanwhile
+ * (`sessionScopeEpoch`): otherwise build it again from a fresh scope. When access keeps changing,
+ * the last answer is given only if every space it shows is still readable now; else nothing is.
+ * The read ledger records only the answer given.
+ */
+async function stableAnswer(
+	scope: OutlineAgentScope,
+	build: (scope: OutlineAgentScope) => Promise<ScopedAnswer>,
+): Promise<OutlineToolOutput> {
+	let current = scope;
+	let answer: ScopedAnswer | null = null;
+	let settled = false;
+	for (let attempt = 0; attempt < ACCESS_ATTEMPTS && !settled; attempt++) {
+		if (attempt > 0) current = await current.reopen();
+		const epoch = sessionScopeEpoch();
+		answer = await build(current);
+		settled = sessionScopeEpoch() === epoch;
+	}
+	if (!answer) throw new Error("no answer was built");
+	if (!settled) {
+		const fresh = await current.reopen();
+		for (const space of answer.spaces) {
+			if (!(await fresh.canRead(space))) {
+				return {
+					output: OUTLINE_TOOL_TEXT.accessChanged,
+					isError: true,
+					metadata: { tool: answer.output.metadata.tool },
+				};
+			}
+		}
+	}
+	if (answer.reads.length > 0) recordOutlineReads(scope.narratorId, answer.reads);
+	return answer.output;
+}
+
 /**
  * `OutlineRead` with address `*`: every space the session may read (its own first, at most
  * {@link OUTLINE_AGENT_READ_LIMITS.overviewSpaces}), each with its pages, expanded together
@@ -294,22 +345,27 @@ async function overviewStructure(
  * read shows on its own, and the space says so. What it shows is a read: recorded in the
  * ledger, links titled where the session may read them.
  */
-async function readAllSpaces(
+async function overviewAnswer(
 	scope: OutlineAgentScope,
 	input: OutlineReadInput,
-): Promise<OutlineToolOutput> {
+): Promise<ScopedAnswer> {
 	const meta: Record<string, unknown> = { tool: "OutlineRead", address: OUTLINE_ALL_SPACES };
 	if (input.asOf !== undefined) {
-		return { output: OUTLINE_TOOL_TEXT.overviewNotAsOf, isError: true, metadata: meta };
+		return {
+			output: { output: OUTLINE_TOOL_TEXT.overviewNotAsOf, isError: true, metadata: meta },
+			reads: [],
+			spaces: [],
+		};
 	}
 	const limits = OUTLINE_AGENT_READ_LIMITS;
 	const { spaces, cut } = await scope.readableSpaces(limits.overviewSpaces);
 	if (spaces.length === 0) {
-		return {
+		const output: OutlineToolOutput = {
 			output: OUTLINE_TOOL_TEXT.allSpacesNone,
 			title: "OutlineRead: *",
 			metadata: { ...meta, spaces: [], complete: cut === null },
 		};
+		return { output, reads: [], spaces: [] };
 	}
 	const view: OutlineView = input.view ?? "facts";
 	const budget = clampBudget(budgetOf(input.budget));
@@ -428,7 +484,9 @@ async function readAllSpaces(
 		});
 	}
 
-	// 4. Content in the order the render spends the budget, then the render.
+	// 4. Content in the order the render spends the budget, then the render: each a stretch of
+	// the main thread of its own (a render of 2000 blocks takes some tens of milliseconds).
+	await yieldToEventLoop();
 	const state = { current: true, seq: 0 };
 	const loadOrder = sectionsBreadthFirst(sections, {
 		view,
@@ -436,11 +494,13 @@ async function readAllSpaces(
 		limit: budget.blocks,
 	});
 	await loadBodiesWithin(state, loadOrder, budget.bytes, { store: scope.store });
+	await yieldToEventLoop();
 	const seen = new Map<string, number>();
 	const display = await displayFor(scope, seen)(
 		state,
 		loadOrder.filter((node) => node.content !== null),
 	);
+	await yieldToEventLoop();
 	const taskPages = plans.reduce((sum, plan) => sum + plan.taskPages, 0);
 	const notes: string[] = [];
 	if (taskPages > 0) notes.push(note(OUTLINE_TOOL_TEXT.taskPagesHidden(taskPages)));
@@ -453,15 +513,12 @@ async function readAllSpaces(
 		notes,
 		interleave: true,
 	});
-	recordOutlineReads(
-		scope.narratorId,
-		rendered.blockIds.flatMap((id) => {
-			const version = seen.get(id);
-			return version === undefined ? [] : [[id, version] as const];
-		}),
-	);
+	const reads = rendered.blockIds.flatMap((id) => {
+		const version = seen.get(id);
+		return version === undefined ? [] : [[id, version] as const];
+	});
 	const shownIds = new Set(rendered.blockIds);
-	return {
+	const output: OutlineToolOutput = {
 		output: `${note(OUTLINE_TOOL_TEXT.allSpacesHeader(spaces.length))}\n${rendered.markdown}`,
 		title: "OutlineRead: *",
 		bounded: true,
@@ -485,6 +542,7 @@ async function readAllSpaces(
 			truncated: truncated || rendered.hiddenByBudget > 0,
 		},
 	};
+	return { output, reads, spaces: plans.map((plan) => plan.space) };
 }
 
 async function readSpace(scope: OutlineAgentScope, name: string): Promise<OutlineToolOutput> {
@@ -609,7 +667,9 @@ export async function outlineRead(
 ): Promise<OutlineToolOutput> {
 	const address = input.address?.trim() ?? "";
 	if (address === "") return await readOverview(scope);
-	if (address === OUTLINE_ALL_SPACES) return await readAllSpaces(scope, input);
+	if (address === OUTLINE_ALL_SPACES) {
+		return await stableAnswer(scope, (current) => overviewAnswer(current, input));
+	}
 	const root = spaceRootName(address);
 	if (root !== null) return await readSpace(scope, root);
 
@@ -713,6 +773,13 @@ export async function outlineSearch(
 	scope: OutlineAgentScope,
 	input: OutlineSearchInput,
 ): Promise<OutlineToolOutput> {
+	return await stableAnswer(scope, (current) => searchAnswer(current, input));
+}
+
+async function searchAnswer(
+	scope: OutlineAgentScope,
+	input: OutlineSearchInput,
+): Promise<ScopedAnswer> {
 	const query = input.query.trim();
 	const spaces: OutlineSpaceRow[] = [];
 	const unknown: string[] = [];
@@ -740,7 +807,7 @@ export async function outlineSearch(
 	}
 	const keys = spaces.map((space) => space.key);
 	if (spaces.length === 0) {
-		return {
+		const output: OutlineToolOutput = {
 			output:
 				unknown.length > 0
 					? OUTLINE_TOOL_TEXT.noSuchSpace(unknown.join(", "))
@@ -748,6 +815,7 @@ export async function outlineSearch(
 			isError: unknown.length > 0,
 			metadata: { tool: "OutlineSearch", query, spaces: [], resultCount: 0, results: [] },
 		};
+		return { output, reads: [], spaces: [] };
 	}
 	const limit = Math.max(
 		1,
@@ -794,7 +862,7 @@ export async function outlineSearch(
 	if (hits.length === 0) {
 		lines.push(ownOnly ? OUTLINE_TOOL_TEXT.noResultsOwn : OUTLINE_TOOL_TEXT.noResults);
 	}
-	return {
+	const output: OutlineToolOutput = {
 		output: lines.join("\n"),
 		title: `OutlineSearch: ${clip(query, 60)}`,
 		metadata: {
@@ -813,4 +881,5 @@ export async function outlineSearch(
 			})),
 		},
 	};
+	return { output, reads: [], spaces };
 }

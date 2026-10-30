@@ -22,7 +22,7 @@
  */
 import { NotFoundError } from "@server/lib/errors";
 import { canAgentWriteSpace, canReadSpace, canWriteSpace, listReadableSpaces } from "../access";
-import { readNarratorTitle, readProjectName } from "../access-reads";
+import { outlineAccessBackend, readNarratorTitle, readProjectName } from "../access-reads";
 import { OUTLINE_ALL_SPACES, outlineRead, outlineSearch } from "../agent-read";
 import { OutlineAgentScope } from "../agent-scope";
 import { OUTLINE_TOOL_TEXT } from "../messages";
@@ -66,6 +66,11 @@ export interface AccessFixtures {
 		capability: "read" | "write" | "manage",
 	): Promise<void>;
 	shareLink(narratorId: string, options: { revoked: boolean; createdBy: string }): Promise<void>;
+	/**
+	 * File the narrator under a project by its working directory (the primary link). Only SQLite
+	 * resolves a session's project from it so far; PostgreSQL knows the explicit project alone.
+	 */
+	linkProject(narratorId: string, projectId: string): Promise<void>;
 	deleteProject(id: string): Promise<void>;
 	deleteUser(id: string): Promise<void>;
 }
@@ -173,7 +178,10 @@ export async function buildAccessWorld(fx: AccessFixtures): Promise<AccessWorld>
 		adminOwned: await session(admin, "private", main),
 		// Visible to a project only a grant to the `user` role opens: past the gate for everyone.
 		roleOpenVis: await session(carol, "project", projects.roleOpen),
+		// Visible to its project, which only its working directory names: Bob's private one.
+		linkedForeign: await session(bob, "project", null),
 	};
+	await fx.linkProject(sessions.linkedForeign, projects.foreign);
 	sessions.sub = await fx.narrator({ owner, visibility: "private", subagentOf: sessions.grantA });
 	sessions.subPriv = await fx.narrator({ owner, visibility: "private", subagentOf: sessions.priv });
 	sessions.orphanSub = await fx.narrator({ owner, visibility: "private", subagentOf: null });
@@ -203,6 +211,7 @@ export async function buildAccessWorld(fx: AccessFixtures): Promise<AccessWorld>
 		"bobPriv",
 		"noProject",
 		"roleOpenVis",
+		"linkedForeign",
 	]) {
 		spaces[`session:${label}`] = await ensureSessionSpace(sessions[label]);
 	}
@@ -769,6 +778,22 @@ function agentCases(world: AccessWorld, cases: AccessCase[]): void {
 				});
 				const ids = new Set(candidates.map((space) => space.id));
 				return readable(may).filter((l) => !ids.has(spaces[l]?.id as string));
+			},
+		});
+
+		cases.push({
+			group: "listing",
+			label: `${label}: a session filed by its working directory under a project it cannot pass is no candidate`,
+			expected: true,
+			actual: async () => {
+				const may = await verdicts(turn);
+				// PostgreSQL resolves no project from the working directory: no gate there.
+				if (outlineAccessBackend() === "postgres" || may.get("session:linkedForeign")) return true;
+				const candidates = await listSessionReadCandidates(sessions[name], {
+					executingUserId: userOf(who),
+					max: 10_000,
+				});
+				return !candidates.some((space) => space.id === spaces["session:linkedForeign"]?.id);
 			},
 		});
 

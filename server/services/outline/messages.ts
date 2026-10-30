@@ -119,6 +119,8 @@ export const OUTLINE_TOOL_TEXT = {
 		`shown without what is under them, each has more blocks than one read of the overview takes: read ${list(labels)} on their own`,
 	notExpandedLimit: (labels: readonly string[]) =>
 		`shown without what is under them, past the blocks one overview reads in all: read ${list(labels)} on their own`,
+	accessChanged:
+		"Who may read this session kept changing while the outline was being read, so nothing is shown. Read it again.",
 	overviewNotAsOf:
 		'asOf reads one block as it was; the overview ("*") shows the spaces as they are now. Read a block with asOf instead.',
 	otherSessionPages: (n: number, more: boolean) =>

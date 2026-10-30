@@ -132,6 +132,11 @@ export class OutlineAgentScope {
 		return new OutlineAgentScope(ctx, await resolveNarratorSpaces(ctx.narratorId));
 	}
 
+	/** The same turn's scope opened afresh, with nothing memoized: after access changed. */
+	async reopen(): Promise<OutlineAgentScope> {
+		return await OutlineAgentScope.open(this.ctx);
+	}
+
 	get narratorId(): string {
 		return this.ctx.narratorId;
 	}
