@@ -6,8 +6,7 @@
  *   1. Locate every address the edits name (`agent-scope.ts`: readable spaces only). `/` is the
  *      default space for new pages: the main project's when this turn may write it, else the
  *      session's own. All edits of a call must land in one space, which this turn must be
- *      allowed to write: one of the session's own spaces (other spaces it reads are read only
- *      for now, and a call aimed at one is refused saying so).
+ *      allowed to write.
  *   2. Parse the markdown and texts (`edit-text.ts`, on a worker when large): read annotations
  *      and the ids a read puts after bullets are dropped, out-of-dialect structure becomes child
  *      blocks, and what was split, converted or kept as text comes back as notes.
@@ -229,8 +228,6 @@ function label(edit: EditState): string {
 
 function refusalText(refusal: OutlineWriteRefusal | "missing", space: string): string {
 	switch (refusal) {
-		case "other-space":
-			return OUTLINE_TOOL_TEXT.edit.otherSpace(space);
 		case "no-person":
 			return OUTLINE_TOOL_TEXT.edit.noPerson;
 		case "plan-or-read-only":

@@ -93,9 +93,6 @@ export const OUTLINE_TOOL_TEXT = {
 		personal: "a personal space",
 	},
 
-	/** After a space that is not one of the session's own. */
-	readOnlySpace: " · read only from this session",
-
 	overviewHeader:
 		'the outline spaces of this session and their pages; read one with OutlineRead { address: "<id>" }; address "*" gives an overview of every space this session can read',
 	spaceSection: (space: string, isDefault: boolean) =>
@@ -119,8 +116,8 @@ export const OUTLINE_TOOL_TEXT = {
 		`not expanded in the overview (more blocks than it loads): read ${list(labels)} on their own`,
 	overviewNotAsOf:
 		'asOf reads one block as it was; the overview ("*") shows the spaces as they are now. Read a block with asOf instead.',
-	otherSpacesReadOnly:
-		"OutlineEdit writes only this session's own spaces (project/, session/, personal/); the other spaces are read only from here",
+	otherSessionPages: (n: number, more: boolean) =>
+		`${more ? `more than ${n} pages` : n === 1 ? "1 page" : `${n} pages`}, not listed: another session's notes are process; read them with view "all", or by address (key/ lists them)`,
 	noSpaces:
 		'This session has no outline pages yet. OutlineEdit creates its space on the first write: { add: "/", markdown: "- A page" } writes to the project\'s space (or, where this turn may not write it, to this session\'s notes); add: "session/" writes to the session\'s notes.',
 	noSuchSpace: (name: string) =>
@@ -166,8 +163,6 @@ export const OUTLINE_TOOL_TEXT = {
 		sessionOnly:
 			"in read-only and plan mode OutlineEdit writes only this session's own space (session/); write there, or leave plan mode",
 		noPermission: (space: string) => `the person running this turn may not write ${space}`,
-		otherSpace: (space: string) =>
-			`${space}: OutlineEdit writes only this session's own spaces (project/, session/, personal/); other spaces are read only from a session for now. Write in one of its own spaces, and link to blocks of this one as [[key/id]]`,
 		defaultToSession:
 			"this turn may not write the project's space, so new pages went to this session's notes (session/)",
 		ambiguous: (ref: string, candidates: readonly string[]) =>

@@ -2,8 +2,9 @@
  * The outline agent tools across spaces, on the isolated SQLite database: reading and searching
  * other spaces the session may read (addresses, labels, the read ledger), the overview of every
  * readable space (`OutlineRead` with address `*`), links to what the session may not read, and
- * `OutlineEdit` refusing other spaces. The permission matrix of who reads what, on SQLite and
- * PostgreSQL, is in `access-matrix.ts` (groups `listing` and `agent`).
+ * `OutlineEdit` in other spaces, which follows the person's write permission as it always has.
+ * The permission matrix of who reads what, on SQLite and PostgreSQL, is in `access-matrix.ts`
+ * (groups `listing` and `agent`).
  *
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own users,
  * projects and sessions.
@@ -142,7 +143,7 @@ afterEach(() => {
 });
 
 describe("reading another space", () => {
-	test("by key/id: labeled key/id, named read only, recorded as read", async () => {
+	test("by key/id: labeled key/id, recorded as read", async () => {
 		const w = await world();
 		const [page, child] = await write(w.billing, w.alice, [
 			{ op: "insert", tempId: "p", parent: null, content: "Invoices" },
@@ -152,9 +153,7 @@ describe("reading another space", () => {
 		const read = await call(outlineReadTool, { address: `${w.billing.key}/${page}` }, c);
 		expect(read.isError).toBeUndefined();
 		const lines = read.output.split("\n");
-		expect(lines[0]).toBe(
-			`‹space ${w.billing.key} · project "Billing" · read only from this session›`,
-		);
+		expect(lines[0]).toBe(`‹space ${w.billing.key} · project "Billing"›`);
 		expect(labels(read.output)).toEqual([`${w.billing.key}/${page}`, `${w.billing.key}/${child}`]);
 		const row = await blockBySid(w.billing, child as string);
 		expect(seenOutlineVersion(w.session, row.id)).toBe(row.versionSeq);
@@ -168,7 +167,6 @@ describe("reading another space", () => {
 		// A space's pages, listed by key.
 		const list = await call(outlineReadTool, { address: `${w.billing.key}/` }, c);
 		expect(list.output).toContain(`- [${w.billing.key}/${page}] Invoices`);
-		expect(list.output.split("\n")[0]).toContain("read only from this session");
 	});
 
 	test("the session's own spaces keep short ids", async () => {
@@ -178,7 +176,6 @@ describe("reading another space", () => {
 		const c = ctx(w.session, w.alice);
 		const read = await call(outlineReadTool, { address: own as string }, c);
 		expect(labels(read.output)).toEqual([own]);
-		expect(read.output.split("\n")[0]).not.toContain("read only");
 		const notes = await call(outlineReadTool, { address: `session/${note}` }, c);
 		expect(labels(notes.output)).toEqual([note]);
 	});
@@ -193,9 +190,7 @@ describe("reading another space", () => {
 			{ address: `${w.otherNotes.key}/${sid}` },
 			ctx(w.session, w.alice),
 		);
-		expect(read.output.split("\n")[0]).toBe(
-			`‹space ${w.otherNotes.key} · session "Login bug" · read only from this session›`,
-		);
+		expect(read.output.split("\n")[0]).toBe(`‹space ${w.otherNotes.key} · session "Login bug"›`);
 		expect(read.output).toContain(`- [${w.otherNotes.key}/${sid}] Repro steps`);
 		// Shared with Bob, the session may read only what Bob may read too.
 		await db.insert(aclGrants).values({
@@ -338,12 +333,11 @@ describe("the overview of every readable space", () => {
 		expect(out).toContain("Tokens live on the server");
 		expect(out).not.toContain("regression");
 		expect(out).toContain("‹facts only: 1 block under tasks not shown");
-		expect(out).toContain(`‹space ${w.billing.key} · project "Billing" · read only`);
+		expect(out).toContain(`‹space ${w.billing.key} · project "Billing"›`);
 		expect(out).toContain(`- [${w.billing.key}/${invoices}] Invoices`);
 		expect(out).toContain("Totals are kept in cents");
 		expect(out).toContain(`‹space ${w.notes.key} · this session's notes›\n‹no pages yet›`);
 		expect(out).toContain("My preferences");
-		expect(out).toContain(OUTLINE_TOOL_TEXT.otherSpacesReadOnly);
 		expect(result.metadata?.complete).toBe(true);
 		// What it showed is a read.
 		const row = await blockBySid(w.billing, invoices as string);
@@ -363,6 +357,36 @@ describe("the overview of every readable space", () => {
 		const asOf = await call(outlineReadTool, { address: "*", asOf: 1 }, c);
 		expect(asOf.isError).toBe(true);
 		expect(asOf.output).toBe(OUTLINE_TOOL_TEXT.overviewNotAsOf);
+	});
+
+	test("another session's notes are process: the facts view counts their pages", async () => {
+		const w = await world();
+		const [repro] = await write(w.otherNotes, w.alice, [
+			{ op: "insert", tempId: "r", parent: null, content: "Repro steps" },
+			{ op: "insert", parent: { tempId: "r" }, content: "Log in twice" },
+			{ op: "insert", parent: null, content: "Hypotheses" },
+		]);
+		await write(w.notes, w.alice, [{ op: "insert", parent: null, content: "Our own notes" }]);
+		const c = ctx(w.session, w.alice);
+		const facts = await call(outlineReadTool, { address: "*" }, c);
+		expect(facts.output).toContain(
+			`‹space ${w.otherNotes.key} · session "Login bug"›\n‹${OUTLINE_TOOL_TEXT.otherSessionPages(2, false)}›`,
+		);
+		expect(facts.output).not.toContain("Repro steps");
+		expect(facts.output).not.toContain("Hypotheses");
+		// The session's own notes are listed as before.
+		expect(facts.output).toContain("Our own notes");
+		const meta = facts.metadata?.spaces as Array<{ key: string; process?: boolean }>;
+		expect(meta.find((s) => s.key === w.otherNotes.key)?.process).toBe(true);
+		expect(meta.find((s) => s.key === w.notes.key)?.process).toBeUndefined();
+
+		const all = await call(outlineReadTool, { address: "*", view: "all" }, c);
+		expect(all.output).toContain(`- [${w.otherNotes.key}/${repro}] Repro steps`);
+		expect(all.output).toContain("Log in twice");
+		expect(all.output).toContain("Hypotheses");
+		// Read by address as ever.
+		const byKey = await call(outlineReadTool, { address: `${w.otherNotes.key}/` }, c);
+		expect(byKey.output).toContain(`- [${w.otherNotes.key}/${repro}] Repro steps`);
 	});
 
 	test("pages that are tasks, pages too large to expand, and spaces past the budget", async () => {
@@ -441,33 +465,93 @@ describe("searching every readable space", () => {
 });
 
 describe("OutlineEdit and other spaces", () => {
-	test("writes only the session's own spaces and says why", async () => {
+	test("another project's space the person may write is written, as before", async () => {
 		const w = await world();
 		const [invoices] = await write(w.billing, w.alice, [
 			{ op: "insert", parent: null, content: "Invoices" },
 		]);
+		const key = w.billing.key;
 		const c = ctx(w.session, w.alice);
-		await call(outlineReadTool, { address: `${w.billing.key}/${invoices}` }, c);
+		const added = await call(
+			outlineEditTool,
+			{ edits: [{ add: `${key}/`, markdown: "- Refunds" }] },
+			c,
+		);
+		expect(added.isError).toBeUndefined();
+		expect(added.output).toContain(`to ${key} · project "Billing"`);
+		// Someone else wrote it: read it, then edit it by its address, as a read labels it too.
+		await call(outlineReadTool, { address: `${key}/${invoices}` }, c);
+		const replaced = await call(
+			outlineEditTool,
+			{ edits: [{ replace: `[${key}/${invoices}]`, text: "Invoices v2" }] },
+			c,
+		);
+		expect(replaced.isError).toBeUndefined();
+		const set = await call(
+			outlineEditTool,
+			{ edits: [{ set: `${key}/${invoices}`, checkbox: "x" }] },
+			c,
+		);
+		expect(set.isError).toBeUndefined();
+		const child = await call(
+			outlineEditTool,
+			{ edits: [{ add: `${key}/${invoices}`, markdown: "- paid in full" }] },
+			c,
+		);
+		expect(child.isError).toBeUndefined();
+		const row = await blockBySid(w.billing, invoices as string);
+		expect(row.content).toBe("Invoices v2");
+		expect(row.taskJson?.status).toBe("done");
+		const rows = await db
+			.select()
+			.from(outlineBlocks)
+			.where(eq(outlineBlocks.spaceId, w.billing.id));
+		const refunds = rows.find((r) => r.content === "Refunds");
+		expect(refunds?.parentId).toBeNull();
+		expect(rows.find((r) => r.content === "paid in full")?.parentId).toBe(row.id);
+		const deleted = await call(
+			outlineEditTool,
+			{ edits: [{ delete: `${key}/${refunds?.sid}` }] },
+			c,
+		);
+		expect(deleted.isError).toBeUndefined();
+		expect((await blockBySid(w.billing, refunds?.sid as string)).deleted).toBe(true);
+	});
+
+	test("a readable space the person may not write is refused, as before", async () => {
+		const w = await world();
+		const open = await ensureProjectSpace(await project(w.bob, "Open", "public"));
+		const [theirs] = await write(open, w.bob, [{ op: "insert", parent: null, content: "Theirs" }]);
+		const c = ctx(w.session, w.alice);
+		const read = await call(outlineReadTool, { address: `${open.key}/${theirs}` }, c);
+		expect(read.output).toContain("Theirs");
 		for (const edit of [
-			{ add: `${w.billing.key}/`, markdown: "- new page" },
-			{ add: `${w.billing.key}/${invoices}`, markdown: "- child" },
-			{ replace: `${w.billing.key}/${invoices}`, text: "Invoices v2" },
-			{ delete: `${w.billing.key}/${invoices}` },
-			{ set: `${w.billing.key}/${invoices}`, checkbox: "x" },
+			{ add: `${open.key}/`, markdown: "- mine" },
+			{ replace: `${open.key}/${theirs}`, text: "changed" },
 		]) {
 			const refused = await call(outlineEditTool, { edits: [edit] }, c);
 			expect(refused.isError).toBe(true);
 			expect(refused.output).toContain("Nothing was written.");
 			expect(refused.output).toContain(
-				"OutlineEdit writes only this session's own spaces (project/, session/, personal/)",
+				OUTLINE_TOOL_TEXT.edit.noPermission(`${open.key} · project "Open"`),
 			);
-			expect(refused.output).toContain(`${w.billing.key} · project "Billing"`);
 		}
-		const row = await blockBySid(w.billing, invoices as string);
-		expect(row.content).toBe("Invoices");
-		expect(row.deleted).toBe(false);
+		expect((await blockBySid(open, theirs as string)).content).toBe("Theirs");
+		// A space it may not read is not found, as ever.
+		const hidden = await call(
+			outlineEditTool,
+			{ edits: [{ add: `${w.hidden.key}/`, markdown: "- nope" }] },
+			c,
+		);
+		expect(hidden.output).toContain(OUTLINE_TOOL_TEXT.noSuchSpace(`${w.hidden.key}/`));
+	});
 
-		// Its own space can link there, and a read copied from there loses its labels.
+	test("what a read of another space shows, copied into the session's own, loses its labels", async () => {
+		const w = await world();
+		const [invoices] = await write(w.billing, w.alice, [
+			{ op: "insert", parent: null, content: "Invoices" },
+		]);
+		const c = ctx(w.session, w.alice);
 		const copied = await call(outlineReadTool, { address: `${w.billing.key}/${invoices}` }, c);
 		const markdown = `${copied.output.split("\n").slice(1).join("\n")}\n- see [[${w.billing.key}/${invoices}]]`;
 		const added = await call(outlineEditTool, { edits: [{ add: "/", markdown }] }, c);
@@ -482,7 +566,7 @@ describe("OutlineEdit and other spaces", () => {
 		]);
 	});
 
-	test("a subagent reads across spaces as its root does and writes only the root's own", async () => {
+	test("a subagent reads across spaces as its root does", async () => {
 		const w = await world();
 		const [invoices] = await write(w.billing, w.alice, [
 			{ op: "insert", parent: null, content: "Invoices" },
@@ -494,12 +578,7 @@ describe("OutlineEdit and other spaces", () => {
 		const overview = await call(outlineReadTool, { address: "*" }, c);
 		const keys = (overview.metadata?.spaces as Array<{ key: string }>).map((s) => s.key);
 		expect(keys.slice(0, 2)).toEqual([w.atlas.key, w.notes.key]);
-		const refused = await call(
-			outlineEditTool,
-			{ edits: [{ add: `${w.otherNotes.key}/`, markdown: "- note" }] },
-			c,
-		);
-		expect(refused.output).toContain("OutlineEdit writes only this session's own spaces");
+		expect(keys).toContain(w.otherNotes.key);
 		const own = await call(
 			outlineEditTool,
 			{ edits: [{ add: "session/", markdown: "- from the subagent" }] },

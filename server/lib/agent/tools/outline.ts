@@ -1,9 +1,9 @@
 /**
  * The outline tools: `OutlineRead` and `OutlineSearch` (core, read-only, across every space the
- * session may read) and `OutlineEdit` (optional, loaded with its routine; the session's own
- * spaces only). The work lives in `server/services/outline/agent-*.ts`,
- * loaded on first use; this module holds the schemas, the descriptions and what only a tool call
- * knows: the turn's person, the session's permission mode and the call's provenance.
+ * session may read) and `OutlineEdit` (optional, loaded with its routine). The work lives in
+ * `server/services/outline/agent-*.ts`, loaded on first use; this module holds the schemas, the
+ * descriptions and what only a tool call knows: the turn's person, the session's permission
+ * mode and the call's provenance.
  *
  * All three are offered only while `outline.enabled` is on. Descriptions are static strings, so
  * an optional tool loaded in the history keeps the prompt cache (`tool-loading.ts`).
@@ -144,7 +144,7 @@ export const outlineReadTool: ToolDefinition = {
 - A page shows facts by default: tasks and everything under them are left out (view "all" includes them; reading a task shows all of it).
 - address: an id, key/id, an alias such as Q17, or a block's title (ids, aliases and titles alone are looked up in this session's own spaces). Omit it to list this session's own spaces and their pages; key/ (or project/, session/, personal/) lists one space's pages; "*" is an overview of every space this session can read, its own first, each with its pages expanded together within the budget.
 - asOf: a commit number or a time, to read the block as it was then.
-To write, use OutlineEdit (copy what you read into it: the ids and ‹…› notes are dropped). It writes only this session's own spaces; the others are read only.`,
+To write, use OutlineEdit (copy what you read into it: the ids and ‹…› notes are dropped).`,
 	parameters: z.object({
 		address: z
 			.string()
@@ -321,7 +321,7 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 
 export const outlineEditTool: ToolDefinition = {
 	name: OUTLINE_EDIT_TOOL,
-	description: `Write to the outline. One call is one commit in one space: all edits apply, or none does. Every commit records who wrote it and can be reverted. Only this session's own spaces are written (its project's, its notes, the personal space); other spaces it reads are read only: link to their blocks as [[key/id]].
+	description: `Write to the outline. One call is one commit in one space: all edits apply, or none does. Every commit records who wrote it and can be reverted.
 edits, in order, each one of:
 - { add: <parent>, markdown, after? }: add blocks written as a markdown outline under a block, or as new pages with key/ (or project/, session/, personal/), or "/" for this session's project space (its own notes when it may not write the project's). after: the sibling to place them after (default: last).
 - { replace: <block>, text }: the block's new text, written like one outline item without its bullet. A checkbox, @assignee and key:: lines in it are applied, whatever you leave out keeps its value, indented items become child blocks.

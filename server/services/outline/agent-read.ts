@@ -25,7 +25,7 @@
  * them all (`OutlineSearch` with spaces `["*"]`; the readable set goes into the SQL filter before
  * the result limit). A space it may not read is never named, listed or searched, and a reference
  * into one gets exactly the answer a reference to nothing gets. Reads of other spaces are
- * recorded in the read ledger like any other; only writes stay in the session's own spaces.
+ * recorded in the read ledger like any other.
  *
  * The output is bounded by the read's budget, so the agent loop must not cut it again (its cut
  * keeps the tail and would lose the top of the outline).
@@ -205,7 +205,9 @@ function pageNode(row: OutlineBlockRow): OutlineNode {
 /**
  * `OutlineRead` with address `*`: every space the session may read (its own first, at most
  * {@link OUTLINE_AGENT_READ_LIMITS.overviewSpaces}), each with its pages expanded together,
- * level by level, within the read's budget (`renderOutlineSections`). Facts only by default.
+ * level by level, within the read's budget (`renderOutlineSections`). Facts only by default:
+ * tasks are left out, and so are other sessions' notes, which are process as a whole (design
+ * §2.1): such a space shows as its line and the number of its pages; view `all` lists them.
  *
  * Bounded before the budget: pages are taken only as far as the budget could show them, each
  * page's structure is read up to {@link OUTLINE_AGENT_READ_LIMITS.overviewPageBlocks} blocks (a
@@ -236,15 +238,38 @@ async function readAllSpaces(
 	let pagesLeft = budget.blocks;
 	let blocksLeft = limits.overviewBlocks;
 	let taskPages = 0;
-	let anyOther = false;
 	let cut = !complete;
 	const sections: OutlineRenderSection[] = [];
 	const roots: OutlineNode[] = [];
 	const spaceMeta: Array<Record<string, unknown>> = [];
 	for (const { space, word } of spaces) {
 		const own = scope.isOwnSpace(space);
-		if (!own) anyOther = true;
 		const label = scope.labelIn(space);
+		const header = [
+			note(OUTLINE_TOOL_TEXT.spaceSection(await scope.describe(space), space.id === context?.id)),
+		];
+		if (view === "facts" && space.kind === "session" && !own) {
+			// Another session's notes are process: counted, not listed (metas only, bounded).
+			const max = limits.maxPagesListed;
+			const count = (await scope.store.listChildMetas(space.id, [null], max + 1)).length;
+			const footer = [
+				note(
+					count === 0
+						? OUTLINE_TOOL_TEXT.noPages
+						: OUTLINE_TOOL_TEXT.otherSessionPages(Math.min(count, max), count > max),
+				),
+			];
+			sections.push({ header, roots: [], footer });
+			spaceMeta.push({
+				key: space.key,
+				kind: space.kind,
+				word,
+				own,
+				pages: Math.min(count, max),
+				process: true,
+			});
+			continue;
+		}
 		const want = Math.min(limits.maxPagesListed, pagesLeft);
 		const listed = await scope.store.listSpacePages(space.id, { limit: want + 1 });
 		const pages = listed.slice(0, want);
@@ -282,9 +307,7 @@ async function readAllSpaces(
 		if (morePages) footer.push(note(OUTLINE_TOOL_TEXT.morePagesOf(space.key)));
 		cut ||= morePages || alone.length > 0;
 		sections.push({
-			header: [
-				note(OUTLINE_TOOL_TEXT.spaceSection(await scope.describe(space), space.id === context?.id)),
-			],
+			header,
 			roots: sectionRoots,
 			label: (node) => label(node.sid),
 			footer,
@@ -304,7 +327,6 @@ async function readAllSpaces(
 	const notes: string[] = [];
 	if (taskPages > 0) notes.push(note(OUTLINE_TOOL_TEXT.taskPagesHidden(taskPages)));
 	if (!complete) notes.push(note(OUTLINE_TOOL_TEXT.moreSpaces));
-	if (anyOther) notes.push(note(OUTLINE_TOOL_TEXT.otherSpacesReadOnly));
 	const rendered = renderOutlineSections(sections, { view, budget, display, notes });
 	recordOutlineReads(
 		scope.narratorId,
