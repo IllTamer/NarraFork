@@ -29,9 +29,15 @@ export interface TaskSourceContractHarness {
 	seedTasks(narratorId: string, tasks: readonly SeedTask[]): Promise<void>;
 	/** Write the narrator's behavior fence. */
 	seedBehaviorFence(narratorId: string, text: string): Promise<void>;
+	/**
+	 * Optional: make this narrator's tasks and fence unreadable until the returned restore
+	 * runs. Without it the failure-semantics tests are skipped.
+	 */
+	makeUnreadable?(narratorId: string): Promise<() => void>;
 }
 
 const texts = (tasks: readonly { text: string }[]) => tasks.map((task) => task.text);
+const STANDALONE_SEVEN = /(?<![0-9])7(?![0-9])/;
 
 export function describeTaskSourceContract(harness: TaskSourceContractHarness): void {
 	async function sourceWith(tasks: readonly SeedTask[] = []) {
@@ -57,7 +63,7 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 				expect(await source.protectedOpenCount()).toBe(0);
 			});
 
-			test("current is the first doing task and next is the first todo task", async () => {
+			test("current is the first doing task, wherever the todo tasks sit", async () => {
 				const { source } = await sourceWith([
 					{ text: "Alpha", status: "done" },
 					{ text: "Bravo", status: "todo" },
@@ -71,11 +77,32 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 					status: "doing",
 					protected: false,
 				});
-				expect(await source.nextTask()).toEqual({
-					text: "Bravo",
-					status: "todo",
-					protected: false,
-				});
+			});
+
+			// `nextTask` is pinned only where every reasonable reading agrees: no todo before the
+			// current task (spec takes the first todo anywhere; a backend may take the first todo
+			// after the current one).
+			test("next is the first todo after the current task", async () => {
+				const { source } = await sourceWith([
+					{ text: "Alpha", status: "done" },
+					{ text: "Charlie", status: "doing" },
+					{ text: "Delta", status: "blocked" },
+					{ text: "Echo", status: "todo" },
+					{ text: "Foxtrot", status: "doing" },
+					{ text: "Golf", status: "todo" },
+				]);
+				expect(await source.nextTask()).toEqual({ text: "Echo", status: "todo", protected: false });
+			});
+
+			test("with nothing in progress, next is the first todo", async () => {
+				const { source } = await sourceWith([
+					{ text: "Alpha", status: "done" },
+					{ text: "Delta", status: "blocked" },
+					{ text: "Echo", status: "todo", protected: true },
+					{ text: "Golf", status: "todo" },
+				]);
+				expect(await source.currentTask()).toBeNull();
+				expect(await source.nextTask()).toEqual({ text: "Echo", status: "todo", protected: true });
 			});
 
 			test("open tasks keep the source order and leave out finished ones", async () => {
@@ -87,9 +114,12 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 					{ text: "Echo", status: "done" },
 					{ text: "Foxtrot", status: "todo" },
 				]);
-				const { tasks } = await source.openTasks();
+				const { tasks, revision } = await source.openTasks();
 				expect(texts(tasks)).toEqual(["Bravo", "Charlie", "Delta", "Foxtrot"]);
 				expect(tasks.map((task) => task.status)).toEqual(["todo", "doing", "blocked", "todo"]);
+				// The interrupt guard dedupes on the key and treats null as a key: with open tasks
+				// it must be a real one.
+				expect(revision).not.toBeNull();
 			});
 
 			test("only unfinished protected tasks count as protected and open", async () => {
@@ -110,7 +140,7 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 				]);
 			});
 
-			test("the revision key is stable without writes and moves with them", async () => {
+			test("the revision key is stable without writes and moves with the open tasks", async () => {
 				const { narratorId, source } = await sourceWith([{ text: "Alpha", status: "todo" }]);
 				const first = (await source.openTasks()).revision;
 				expect(first).not.toBeNull();
@@ -122,6 +152,14 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 				const second = (await source.openTasks()).revision;
 				expect(second).not.toBeNull();
 				expect(second).not.toBe(first);
+				// A status change alone (here: to blocked/waiting) is a change of the open tasks.
+				await harness.seedTasks(narratorId, [
+					{ text: "Alpha", status: "blocked" },
+					{ text: "Bravo", status: "todo" },
+				]);
+				const third = (await source.openTasks()).revision;
+				expect(third).not.toBeNull();
+				expect(third).not.toBe(second);
 			});
 		});
 
@@ -243,7 +281,7 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 							task,
 							cause: "spec",
 							passes: 2,
-							maxPasses: 6,
+							maxPasses: 9,
 							canAskUserQuestion: false,
 							locale,
 						});
@@ -251,8 +289,11 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 							expect(prompt).toContain(task.text);
 							expect(prompt).toContain(marker);
 						}
-						// A bounded run is told how many passes it has left.
-						expect(bounded).toContain("4");
+						// A bounded run is told how many passes it has left (9 − 2 = 7) as a number of
+						// its own; an open run has no budget to state. The exact wording is the
+						// backend's (spec pins it in its own test).
+						expect(bounded).toMatch(STANDALONE_SEVEN);
+						expect(open).not.toMatch(STANDALONE_SEVEN);
 					}
 				}
 			});
@@ -312,24 +353,62 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 				}
 			});
 
-			test("a task digest, when there is one, leads with the current task", async () => {
+			// Never null while readable: with the default fence settings the behavior fence is
+			// injected only alongside a non-null digest, so a quiet digest would drop it too.
+			test("a readable source always has a digest, led by the current task", async () => {
 				const { source } = await sourceWith([
 					{ text: "Write the parser", status: "doing" },
 					{ text: "Write the printer", status: "todo" },
 				]);
 				const digest = await source.taskDigest();
-				if (digest === null) return;
-				expect(digest.kind).toBe("tasks");
-				if (digest.kind !== "tasks") return;
+				expect(digest?.kind).toBe("tasks");
+				if (digest?.kind !== "tasks") return;
 				expect(digest.tasks?.[0]).toMatchObject({ role: "doing", text: "Write the parser" });
 			});
 
-			test("a task digest without tasks mentions no task", async () => {
-				const { source } = await sourceWith();
-				const digest = await source.taskDigest();
-				if (digest === null || digest.kind !== "tasks") return;
-				expect(digest.tasks ?? []).toEqual([]);
+			test("without open tasks the digest is an empty variant, never null", async () => {
+				const never = await sourceWith();
+				expect(await never.source.taskDigest()).toEqual({ kind: "tasks", variant: "emptyNever" });
+
+				const done = await sourceWith([
+					{ text: "Write the parser", status: "done" },
+					{ text: "Write the printer", status: "done" },
+				]);
+				expect(await done.source.taskDigest()).toEqual({ kind: "tasks", variant: "emptyDone" });
 			});
+		});
+
+		describe("unreadable tasks", () => {
+			const makeUnreadable = harness.makeUnreadable;
+			test.skipIf(!makeUnreadable)(
+				"data reads reject, injection reads resolve to null, continuation finds nothing",
+				async () => {
+					if (!makeUnreadable) return;
+					const { narratorId, source } = await sourceWith([
+						{ text: "Write the parser", status: "doing", protected: true },
+					]);
+					await harness.seedBehaviorFence(narratorId, "Never force-push the main branch.");
+					const restore = await makeUnreadable.call(harness, narratorId);
+					try {
+						await expect(source.currentTask()).rejects.toThrow();
+						await expect(source.nextTask()).rejects.toThrow();
+						await expect(source.openTasks()).rejects.toThrow();
+						await expect(source.protectedOpenCount()).rejects.toThrow();
+						await expect(source.prepareContinuation({ promoteTodo: true })).rejects.toThrow();
+						expect(await source.taskDigest()).toBeNull();
+						expect(await source.behaviorFence()).toBeNull();
+						expect(await source.compactContext("en")).toBeNull();
+						// The continuation reader treats it as nothing to continue.
+						const { readSpecContinuationState } = await import("../../narrator-session");
+						expect(await readSpecContinuationState(narratorId)).toEqual({
+							openTask: null,
+							protectedOpenCount: 0,
+						});
+					} finally {
+						restore();
+					}
+				},
+			);
 		});
 	});
 }

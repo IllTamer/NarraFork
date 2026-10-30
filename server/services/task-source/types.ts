@@ -1,6 +1,8 @@
 /**
  * The task source: the one way continuation, the periodic task digest, the behavior
- * fence, the interrupt guard, compact and the status bar read a narrator's tasks.
+ * fence, the interrupt guard and compact read a narrator's tasks. `currentTask` is the
+ * status bar's read; the status bar itself still reads `GET /spec/tasks` until the task
+ * board replaces the Spec panel (outline P2, PR 5).
  *
  * Shaped by what those readers need, not by tasks.json:
  * - Where a reader's own logic does not depend on the backend (the interrupt guard's
@@ -56,9 +58,15 @@ export interface OpenTaskList {
 	/** Unfinished tasks in the source's own order (spec: array order; outline: document order). */
 	tasks: OpenTaskView[];
 	/**
-	 * Changes whenever the tasks change and only then; null when the source cannot tell.
-	 * The interrupt guard dedupes on it so one version yields one note. Spec: the id of
-	 * tasks.json's current revision.
+	 * Must change whenever the open tasks change, and stay put while nothing is written;
+	 * it may move more often than strictly needed (spec moves it on every tasks.json
+	 * write). The interrupt guard dedupes on it — one key, one note — and treats null as a
+	 * key like any other, so it must not be null while `tasks` is non-empty.
+	 *
+	 * Spec: the id of tasks.json's current revision. A backend whose `blocked` is derived
+	 * (outline: waiting on a person or a prerequisite) must fold that derivation into the
+	 * key — a question asked or answered, a prerequisite finished — or the guard will not
+	 * speak again after the open list's statuses changed.
 	 */
 	revision: string | null;
 }
@@ -110,10 +118,11 @@ export interface InterruptGuardNote {
  * One narrator's task source.
  *
  * When the tasks cannot be read (spec: tasks.json is not valid JSON, …), the task-data
- * reads reject and each reader handles it as it always has (continuation treats it as
- * nothing to continue, the interrupt guard logs and lets the interrupt finish). The
- * injection reads (`taskDigest`, `behaviorFence`, `compactContext`) never reject; null
- * means "inject nothing".
+ * reads and `prepareContinuation` reject, and each reader handles it as it always has
+ * (continuation treats it as nothing to continue, the interrupt guard logs and lets the
+ * interrupt finish). The injection reads (`taskDigest`, `behaviorFence`, `compactContext`)
+ * resolve to null instead; their readers also catch a rejection, but a source must not
+ * rely on that. The contract suite pins both halves.
  */
 export interface NarratorTaskSource {
 	readonly backend: TaskBackend;
@@ -121,9 +130,17 @@ export interface NarratorTaskSource {
 
 	// ── Task data ─────────────────────────────────────────────────────────────
 
-	/** The first task in progress, or null. This is what the status bar shows. */
+	/**
+	 * The first task in progress, or null. The status bar shows this task (it still reads
+	 * `GET /spec/tasks` until PR 5 switches it to the task source).
+	 */
 	currentTask(): Promise<TaskView | null>;
-	/** The first task not started yet, or null. */
+	/**
+	 * A task not started yet that would be taken up next, or null when none is waiting.
+	 * Spec takes the first todo in array order, even one listed before the current task;
+	 * another backend may take the first todo after the current task. Readers may rely on
+	 * the two agreeing only when no todo precedes the current task (or nothing is current).
+	 */
 	nextTask(): Promise<TaskView | null>;
 	/** Unfinished tasks plus the revision key; read by the interrupt guard. */
 	openTasks(): Promise<OpenTaskList>;
@@ -146,7 +163,17 @@ export interface NarratorTaskSource {
 
 	// ── Injections ────────────────────────────────────────────────────────────
 
-	/** The digest injected every N completed tool calls (`living_work_spec`); null skips it. */
+	/**
+	 * The digest injected every N completed tool calls (`living_work_spec`).
+	 *
+	 * Never null while the source is readable: with no open tasks it is an empty variant
+	 * (spec: `emptyNever` / `emptyDone`, which nudge the model to create or reorganize
+	 * tasks). Null means only that the read failed. This is load-bearing beyond the digest
+	 * itself: under the default settings (`behaviorFenceInterval: -1`,
+	 * `behaviorFenceAttachTasks: true`) the behavior fence is injected only alongside a
+	 * non-null digest, so a source that went quiet without tasks would drop the fence too.
+	 * A backend that retires this digest must deliver the fence some other way first.
+	 */
 	taskDigest(): Promise<SideCarBody | null>;
 	/** The behavior fence (`behavior_fence`); null when empty or unreadable, never injected. */
 	behaviorFence(): Promise<SideCarBody | null>;

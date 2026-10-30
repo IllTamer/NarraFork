@@ -17,6 +17,7 @@ import {
 } from "../../spec-reminder";
 import { specVfsService, writeSpecFile } from "../../spec-vfs-service";
 import { buildSpecContinuationPrompt } from "../../turn-continuation-decisions";
+import * as taskSourceIndex from "../index";
 import { resolveTaskBackend, taskSourceForNarrator } from "../index";
 import { describeTaskSourceContract, type SeedTask } from "./task-source-contract.harness";
 
@@ -52,6 +53,38 @@ async function seedTasks(narratorId: string, tasks: readonly SeedTask[]): Promis
 	);
 }
 
+/**
+ * Unreadable for one narrator: tasks.json comes back as broken JSON (so parsing fails, as
+ * with a corrupted row) and the fence read rejects. Other narrators read normally.
+ */
+async function makeUnreadable(narratorId: string): Promise<() => void> {
+	const realReadTasks = specVfsService.readTasksFileForNarrator;
+	const realReadFile = specVfsService.readSpecFile;
+	const readTasks = spyOn(specVfsService, "readTasksFileForNarrator").mockImplementation(
+		async (id) =>
+			id === narratorId
+				? {
+						path: "tasks.json",
+						uri: "spec://tasks.json",
+						content: "{ not json",
+						readonly: false,
+						uiEditable: true,
+						builtin: true,
+						revisionId: "broken",
+						namespaceId: "broken",
+					}
+				: realReadTasks(id),
+	);
+	const readFile = spyOn(specVfsService, "readSpecFile").mockImplementation(async (id, uri) => {
+		if (id === narratorId) throw new Error("spec file unreadable");
+		return realReadFile(id, uri);
+	});
+	return () => {
+		readTasks.mockRestore();
+		readFile.mockRestore();
+	};
+}
+
 describeTaskSourceContract({
 	backend: "spec",
 	createNarrator,
@@ -59,15 +92,30 @@ describeTaskSourceContract({
 	seedBehaviorFence: async (narratorId, text) => {
 		await writeSpecFile(narratorId, "spec://behavior_fence", text, { actor: "user" });
 	},
+	makeUnreadable,
 });
 
 describe("task source factory", () => {
-	test("every narrator resolves to spec without touching the database", async () => {
+	test("every narrator resolves to spec, even one with no narrator row", async () => {
 		const unknownNarratorId = `missing-${generateId()}`;
 		expect(await resolveTaskBackend(unknownNarratorId)).toBe("spec");
 		const source = await taskSourceForNarrator(unknownNarratorId);
 		expect(source.backend).toBe("spec");
 		expect(source.narratorId).toBe(unknownNarratorId);
+	});
+
+	test("a backend that cannot be resolved falls back to spec instead of rejecting", async () => {
+		const resolve = spyOn(taskSourceIndex, "resolveTaskBackend").mockRejectedValue(
+			new Error("backend lookup failed"),
+		);
+		try {
+			const source = await taskSourceForNarrator("any-narrator");
+			expect(source.backend).toBe("spec");
+			expect(source.narratorId).toBe("any-narrator");
+			expect(resolve).toHaveBeenCalledTimes(1);
+		} finally {
+			resolve.mockRestore();
+		}
 	});
 });
 
@@ -126,6 +174,23 @@ describe("spec task source keeps the readers' behavior", () => {
 				}
 			}
 		}
+		// The remaining-pass line, worded exactly (9 − 2 = 7 left).
+		const remaining = (locale: "en" | "zh-CN") =>
+			source.continuationPrompt({
+				form: "bounded",
+				task: { text: "Ship it", protected: false, status: "doing" },
+				cause: "spec",
+				passes: 2,
+				maxPasses: 9,
+				canAskUserQuestion: true,
+				locale,
+			});
+		expect(remaining("en")).toEndWith(
+			"\n\nSelf-continuations left: 7. When they run out this run ends, so do not save your summary for a later pass.",
+		);
+		expect(remaining("zh-CN")).toEndWith(
+			"\n\n剩余自动续跑次数：7。用完后本次运行会结束，所以不要把总结留到最后一趟。",
+		);
 	});
 
 	test("open continuation copy is unchanged", async () => {
@@ -245,34 +310,5 @@ describe("spec task source keeps the readers' behavior", () => {
 				updatedBy: "agent",
 			},
 		]);
-	});
-
-	test("an unreadable tasks.json throws from data reads and stays silent in injections", async () => {
-		const narratorId = await createNarrator();
-		const read = spyOn(specVfsService, "readTasksFileForNarrator").mockResolvedValue({
-			path: "tasks.json",
-			uri: "spec://tasks.json",
-			content: "{ not json",
-			readonly: false,
-			uiEditable: true,
-			builtin: true,
-			revisionId: "broken",
-			namespaceId: "broken",
-		});
-		restores.push(() => read.mockRestore());
-
-		const source = await taskSourceForNarrator(narratorId);
-		await expect(source.currentTask()).rejects.toThrow();
-		await expect(source.openTasks()).rejects.toThrow();
-		await expect(source.prepareContinuation({ promoteTodo: true })).rejects.toThrow();
-		expect(await source.taskDigest()).toBeNull();
-		expect(await source.compactContext("en")).toBeNull();
-
-		// The continuation reader treats it as nothing to continue, as it always has.
-		const { readSpecContinuationState } = await import("../../narrator-session");
-		expect(await readSpecContinuationState(narratorId)).toEqual({
-			openTask: null,
-			protectedOpenCount: 0,
-		});
 	});
 });

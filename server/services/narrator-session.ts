@@ -2499,13 +2499,16 @@ export async function drainInjectionsIntoHistory(
 	).due(count);
 
 	// Both bodies come from the narrator's task source, resolved only when a cadence is due
-	// and at most once per drain.
+	// and at most once per drain. Injection reads resolve to null rather than reject; the
+	// catch keeps it that way for any source, since nothing above this drain catches.
 	let taskSource: NarratorTaskSource | undefined;
 	const getTaskSource = async () => {
 		taskSource ??= await taskSourceForNarrator(narratorId);
 		return taskSource;
 	};
-	const tasksBody = atTasksCadence ? await (await getTaskSource()).taskDigest() : null;
+	const tasksBody = atTasksCadence
+		? await (await getTaskSource()).taskDigest().catch(() => null)
+		: null;
 	if (tasksBody) {
 		// Stamp the cadence that raised this digest so the reader-facing header can say
 		// "每 N 次工具调用", distinguishing a routine digest from a turn-end
@@ -2528,7 +2531,7 @@ export async function drainInjectionsIntoHistory(
 	// The fence goes out on its own cadence, or alongside a tasks reminder when the
 	// narrator is configured to attach the two.
 	if (atFenceCadence || (!!active._fenceAttach && !!tasksBody)) {
-		const fenceBody = await (await getTaskSource()).behaviorFence();
+		const fenceBody = await (await getTaskSource()).behaviorFence().catch(() => null);
 		if (fenceBody) {
 			const { body, content } = sideCarBodyWithText("behavior_fence", fenceBody, locale);
 			const { messageId, turnText } = await deliverInjection(narratorId, {
