@@ -29,6 +29,9 @@ const originalApply = api.applyUpdate;
 const originalCancel = api.cancelUpdate;
 const originalNotes = api.getUpdateNotes;
 const globals = new Map<string, PropertyDescriptor | undefined>();
+const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
 let root: Root | undefined;
 let container: HTMLElement;
 let client: QueryClient;
@@ -59,41 +62,8 @@ function install(key: string, value: unknown) {
 	Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
 }
 
-/**
- * Timers and animation frames scheduled while a test's DOM is installed belong to that DOM.
- * Mantine's useTransition can outlive its component: when the first animation frame's flushSync
- * flushes an earlier commit that unmounts the Transition, its cleanup runs first and the frame
- * callback then still schedules the next frame and a `window.setTimeout` (150 ms) that is never
- * cleared. If that timer fires after teardown removed `window`, its setState makes React read
- * `window.event` and the run reports "ReferenceError: window is not defined" between tests.
- * A browser drops a discarded document's timers; teardown does the same here.
- */
-const realSetTimeout = globalThis.setTimeout;
-const realClearTimeout = globalThis.clearTimeout;
-const domTimers = new Set<ReturnType<typeof setTimeout>>();
-function domSetTimeout(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) {
-	const id = realSetTimeout(() => {
-		domTimers.delete(id);
-		callback(...args);
-	}, ms);
-	domTimers.add(id);
-	return id;
-}
-function domClearTimeout(id: ReturnType<typeof setTimeout> | undefined) {
-	if (id === undefined) return;
-	domTimers.delete(id);
-	realClearTimeout(id);
-}
-function cancelDomTimers() {
-	for (const id of domTimers) realClearTimeout(id);
-	domTimers.clear();
-}
-
 beforeEach(() => {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
-	// linkedom's window proxies globalThis, so `window.setTimeout` is this global.
-	install("setTimeout", domSetTimeout);
-	install("clearTimeout", domClearTimeout);
 	for (const key of [
 		"window",
 		"document",
@@ -106,11 +76,29 @@ beforeEach(() => {
 		"Event",
 	])
 		install(key, key === "window" ? window : window[key as keyof typeof window]);
+	// linkedom's window timers delegate to globalThis. Own both timeout and RAF
+	// work for this DOM lifetime: Mantine's nested RAF can leave a transition
+	// timeout behind even after React unmounts its owner.
+	install(
+		"setTimeout",
+		(callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+			const timer = nativeSetTimeout(() => {
+				pendingTimers.delete(timer);
+				callback(...args);
+			}, delay);
+			pendingTimers.add(timer);
+			return timer;
+		},
+	);
+	install("clearTimeout", (timer: ReturnType<typeof setTimeout>) => {
+		pendingTimers.delete(timer);
+		nativeClearTimeout(timer);
+	});
 	install("IS_REACT_ACT_ENVIRONMENT", true);
 	install("requestAnimationFrame", (callback: FrameRequestCallback) =>
-		domSetTimeout(() => callback(Date.now()), 0),
+		setTimeout(() => callback(Date.now()), 0),
 	);
-	install("cancelAnimationFrame", domClearTimeout);
+	install("cancelAnimationFrame", (id: ReturnType<typeof setTimeout>) => clearTimeout(id));
 	install("matchMedia", () => ({
 		matches: false,
 		addEventListener() {},
@@ -168,7 +156,8 @@ afterEach(async () => {
 	api.getSettings = originalGetSettings;
 	api.updateSettings = originalUpdateSettings;
 	await translation.changeLanguage("en");
-	cancelDomTimers();
+	clearDOMTimers();
+	expect(pendingTimers.size).toBe(0);
 	for (const [key, descriptor] of globals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
@@ -176,6 +165,38 @@ afterEach(async () => {
 	globals.clear();
 });
 afterAll(() => mock.restore());
+
+function clearDOMTimers() {
+	for (const timer of pendingTimers) nativeClearTimeout(timer);
+	pendingTimers.clear();
+}
+
+test.each([
+	"nested RAF",
+	"transition timeout",
+])("DOM teardown cancels a pending %s before restoring window", async (stage) => {
+	let called = false;
+	await new Promise<void>((resolve) => {
+		requestAnimationFrame(() => {
+			requestAnimationFrame(() => {
+				if (stage === "nested RAF") called = true;
+				else {
+					window.setTimeout(() => {
+						called = true;
+					}, 10);
+					resolve();
+				}
+			});
+			if (stage === "nested RAF") resolve();
+		});
+	});
+	expect(pendingTimers.size).toBe(1);
+	clearDOMTimers();
+	expect(pendingTimers.size).toBe(0);
+	// Use the native clock so cleanup cannot cancel the verification itself.
+	await new Promise((resolve) => nativeSetTimeout(resolve, 20));
+	expect(called).toBe(false);
+});
 
 async function settle() {
 	await act(async () => {
