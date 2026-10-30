@@ -119,6 +119,26 @@ export function subtreeNodes(root: OutlineNode): OutlineNode[] {
 	return out;
 }
 
+/**
+ * The nodes a view shows of several trees, as a sectioned render expands them: the roots the
+ * view keeps first (the facts view leaves out roots that are tasks), then breadth first, at most
+ * `limit`.
+ */
+export function breadthFirstForest(
+	roots: readonly OutlineNode[],
+	view: OutlineView,
+	limit: number,
+): OutlineNode[] {
+	const out = roots.filter((root) => view === "all" || root.task === null).slice(0, limit);
+	for (let i = 0; i < out.length && out.length < limit; i++) {
+		for (const child of viewChildren(out[i] as OutlineNode, view)) {
+			if (out.length >= limit) break;
+			out.push(child);
+		}
+	}
+	return out.slice(0, Math.max(0, limit));
+}
+
 /** The nodes a view shows of the subtree, root first, breadth first, at most `limit`. */
 export function breadthFirst(root: OutlineNode, view: OutlineView, limit: number): OutlineNode[] {
 	const out = [root];

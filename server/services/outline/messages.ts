@@ -61,7 +61,10 @@ const MERGE_FIELD_NAMES: Record<string, string> = {
 	tags: "tags",
 };
 
-function list(items: readonly string[], max = 6): string {
+/** Items a list in a message names; the rest are counted. */
+export const OUTLINE_LISTED_NAMES = 6;
+
+function list(items: readonly string[], max = OUTLINE_LISTED_NAMES): string {
 	const shown = items.slice(0, max).join(", ");
 	return items.length > max ? `${shown} and ${items.length - max} more` : shown;
 }
@@ -90,20 +93,40 @@ export const OUTLINE_TOOL_TEXT = {
 		personal: "a personal space",
 	},
 
+	/** After a space that is not one of the session's own. */
+	readOnlySpace: " · read only from this session",
+
 	overviewHeader:
-		'the outline spaces of this session and their pages; read one with OutlineRead { address: "<id>" }',
+		'the outline spaces of this session and their pages; read one with OutlineRead { address: "<id>" }; address "*" gives an overview of every space this session can read',
 	spaceSection: (space: string, isDefault: boolean) =>
 		`space ${space}${isDefault ? "; bare ids and titles are looked up here first" : ""}`,
 	noPages: "no pages yet",
 	morePages: "more pages not listed; find them with OutlineSearch",
 	writeHint:
 		"to write, use OutlineEdit (if it is not in your tool list, load it with /load OutlineEdit)",
+
+	allSpacesHeader: (n: number) =>
+		`overview of ${n === 1 ? "the 1 space" : `${n} spaces`} this session can read, its own first: each space's pages, expanded level by level within the budget. Blocks of its own spaces are labeled with their id, blocks of other spaces with key/id; read one with OutlineRead { address: "<id or key/id>" }`,
+	allSpacesNone:
+		'This session can read no outline space yet. OutlineEdit creates its own on the first write: { add: "/", markdown: "- A page" }.',
+	moreSpaces:
+		'this session can read more spaces than the overview lists: read one by its key (key/), or search them all with OutlineSearch { spaces: ["*"] }',
+	morePagesOf: (key: string) =>
+		`more pages than the overview takes; OutlineRead { address: "${key}/" } lists them`,
+	taskPagesHidden: (n: number) =>
+		`facts only: ${n === 1 ? "1 page that is a task" : `${n} pages that are tasks`} not shown; read with view "all" to include them`,
+	notExpanded: (labels: readonly string[]) =>
+		`not expanded in the overview (more blocks than it loads): read ${list(labels)} on their own`,
+	overviewNotAsOf:
+		'asOf reads one block as it was; the overview ("*") shows the spaces as they are now. Read a block with asOf instead.',
+	otherSpacesReadOnly:
+		"OutlineEdit writes only this session's own spaces (project/, session/, personal/); the other spaces are read only from here",
 	noSpaces:
 		'This session has no outline pages yet. OutlineEdit creates its space on the first write: { add: "/", markdown: "- A page" } writes to the project\'s space (or, where this turn may not write it, to this session\'s notes); add: "session/" writes to the session\'s notes.',
 	noSuchSpace: (name: string) =>
 		`No outline space ${quoted(name)} that this session can read. Name a space by its key, or project/, session/ or personal/.`,
 	notFound: (ref: string) =>
-		`Nothing this session can read matches ${quoted(ref)}. An address is key/id (Kx81mPqa/Ab3dEf9Q), an id, an alias such as Q17, or a block's title. Find blocks with OutlineSearch, or list the session's spaces with OutlineRead and no address.`,
+		`Nothing this session can read matches ${quoted(ref)}. An address is key/id (Kx81mPqa/Ab3dEf9Q), an id, an alias such as Q17, or a block's title; ids, aliases and titles alone are looked up in this session's own spaces. Find blocks with OutlineSearch, or list the spaces with OutlineRead (no address: this session's own; "*": every space it can read).`,
 	ambiguous: (ref: string) => `${quoted(ref)} matches several blocks; read one by its address`,
 	deleted: (address: string) =>
 		`${address} is deleted. Read it as it was with asOf (a commit number or a time before it was deleted).`,
@@ -116,6 +139,8 @@ export const OUTLINE_TOOL_TEXT = {
 
 	searchHeader: (n: number, query: string, spaces: readonly string[]) =>
 		`${n === 1 ? "1 result" : `${n} results`} for ${quoted(query)} in ${list(spaces)}`,
+	searchedSome: (n: number) =>
+		`searched the first ${n} spaces this session can read; there are more: name them in spaces to search them`,
 	spacesNotSearched: (names: readonly string[]) =>
 		`not searched (no readable space by that name): ${list(names)}`,
 	inPath: (titles: readonly string[]) => `in ${titles.join(" › ")}`,
@@ -123,6 +148,8 @@ export const OUTLINE_TOOL_TEXT = {
 	isTask: "a task",
 	sessionNotes: "in a session's notes",
 	noResults: "No blocks match. Try other words, or fewer of them.",
+	noResultsOwn:
+		'No blocks match in this session\'s own spaces. Try other words, or fewer of them, or spaces: ["*"] to search every space this session can read.',
 
 	textTooLarge: (bytes: number, max: number) =>
 		`The edit carries ${bytes} bytes of text; one call takes at most ${max}. Split it into several calls.`,
@@ -139,6 +166,8 @@ export const OUTLINE_TOOL_TEXT = {
 		sessionOnly:
 			"in read-only and plan mode OutlineEdit writes only this session's own space (session/); write there, or leave plan mode",
 		noPermission: (space: string) => `the person running this turn may not write ${space}`,
+		otherSpace: (space: string) =>
+			`${space}: OutlineEdit writes only this session's own spaces (project/, session/, personal/); other spaces are read only from a session for now. Write in one of its own spaces, and link to blocks of this one as [[key/id]]`,
 		defaultToSession:
 			"this turn may not write the project's space, so new pages went to this session's notes (session/)",
 		ambiguous: (ref: string, candidates: readonly string[]) =>

@@ -25,7 +25,8 @@
  * not admins. Past the cap only what is open to every signed-in user, and the main project's
  * space, stay readable. A list of every reader of a session exists nowhere else in the
  * repository (`listNarratorAudience` deliberately under-reports), so this answers space by space
- * rather than producing a readable set.
+ * rather than producing a readable set; {@link listSessionReadableSpaces} lists one by judging
+ * candidates that SQL narrows down first, a bounded number of them.
  *
  * CACHING
  * -------
@@ -49,6 +50,7 @@ import {
 } from "./access";
 import {
 	type NarratorAccessRow,
+	type OutlineSpaceCandidates,
 	type ProjectAccessRow,
 	readHasActivePublicShare,
 	readJudgedNarrator,
@@ -57,8 +59,10 @@ import {
 	readNonAdminUserIds,
 	readProject,
 	readScopeGrants,
+	readSpaceCandidatePage,
 } from "./access-reads";
 import { isOrphanedSpace } from "./spaces";
+import { outlineStore } from "./store";
 import type { OutlineSpaceRow } from "./store/port";
 
 /**
@@ -375,4 +379,127 @@ export async function canSessionReadSpace(
 		);
 	}
 	return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Listing
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const OUTLINE_SESSION_LIST_LIMITS = {
+	/** Spaces one listing returns at most. */
+	maxSpaces: 200,
+	/**
+	 * Candidates one listing judges, by default: a session read by several people is offered
+	 * every space one of them reads, and only some pass.
+	 */
+	defaultCandidates: 300,
+	/** Candidates one listing may be asked to judge at most. */
+	maxCandidates: 2000,
+	/** Candidate rows one statement reads. */
+	candidatePage: 100,
+} as const;
+
+export interface SessionReadableSpaces {
+	/** Readable spaces, the session's own first (see {@link listSessionReadableSpaces}). */
+	spaces: OutlineSpaceRow[];
+	/** False when more may be readable than were listed: a limit cut the listing short. */
+	complete: boolean;
+}
+
+/** Where to look for what the session may read besides its own spaces; null: nowhere. */
+function candidateSource(
+	state: ScopeState,
+): { from: OutlineSpaceCandidates; kinds: Array<"project" | "session"> } | null {
+	// Without a main project nothing but the session's own space and personal space is readable.
+	if (state.mainProject === null) return null;
+	if (state.audience.kind !== "people") return { from: { kind: "open" }, kinds: ["project"] };
+	// Any reader will do: the session reads only what all of them read. The owner comes first.
+	const anchor = state.audience.userIds[0];
+	return {
+		from: anchor === undefined ? { kind: "all" } : { kind: "reader", userId: anchor },
+		kinds: ["project", "session"],
+	};
+}
+
+function clampCount(value: number | undefined, fallback: number, max: number): number {
+	return value === undefined || !Number.isFinite(value)
+		? fallback
+		: Math.max(1, Math.min(max, Math.floor(value)));
+}
+
+/**
+ * The spaces an agent working in the session may read, each judged by
+ * {@link canSessionReadSpace}, so nothing is listed that a read by key would refuse. In order:
+ * the session's own space (its root's), its main project's, the personal space (for the turn's
+ * person), then other projects' spaces, then other sessions' spaces, each kind in id order.
+ *
+ * Candidates come from SQL, filtered before the LIMIT: the spaces one reader of the session reads
+ * (the owner unless an admin) and what is open to every signed-in user; every space when only
+ * admins read the session; spaces of projects open to everyone for a public session, one shared
+ * by link or one past the reader cap (other sessions' spaces are never readable then).
+ *
+ * Bounded: at most `limit` spaces (200) and `maxCandidates` candidates judged (300 by default),
+ * a hundred rows per statement; verdicts are cached with the session's scope. `complete` says
+ * whether the listing reached the end.
+ */
+export async function listSessionReadableSpaces(
+	narratorId: string,
+	options: SessionReadOptions & { limit: number; maxCandidates?: number },
+): Promise<SessionReadableSpaces> {
+	const state = await entryFor(narratorId).state;
+	const limit = clampCount(options.limit, 1, OUTLINE_SESSION_LIST_LIMITS.maxSpaces);
+	const maxCandidates = clampCount(
+		options.maxCandidates,
+		OUTLINE_SESSION_LIST_LIMITS.defaultCandidates,
+		OUTLINE_SESSION_LIST_LIMITS.maxCandidates,
+	);
+	const read = { executingUserId: options.executingUserId ?? null };
+	const out: OutlineSpaceRow[] = [];
+	const seen = new Set<string>();
+	const consider = async (space: OutlineSpaceRow | null) => {
+		if (!space || seen.has(space.id)) return;
+		seen.add(space.id);
+		if (await canSessionReadSpace(narratorId, space, read)) out.push(space);
+	};
+	const done = (complete: boolean): SessionReadableSpaces => ({
+		spaces: out.slice(0, limit),
+		complete: complete && out.length <= limit,
+	});
+	if (state.rootNarratorId === null) return done(true);
+
+	await consider(
+		await outlineStore.findSpace({ kind: "session", narratorId: state.rootNarratorId }),
+	);
+	if (state.mainProjectId !== null) {
+		await consider(
+			await outlineStore.findSpace({ kind: "project", projectId: state.mainProjectId }),
+		);
+	}
+	if (read.executingUserId) {
+		await consider(
+			await outlineStore.findSpace({ kind: "personal", ownerUserId: read.executingUserId }),
+		);
+	}
+
+	const source = candidateSource(state);
+	if (source === null) return done(true);
+	const page = OUTLINE_SESSION_LIST_LIMITS.candidatePage;
+	let judged = 0;
+	for (const kind of source.kinds) {
+		let afterId: string | undefined;
+		for (;;) {
+			const rows = await readSpaceCandidatePage(source.from, { kind, afterId, limit: page });
+			for (const space of rows) {
+				if (seen.has(space.id)) continue;
+				// One past the limit tells that the listing is not complete.
+				if (out.length > limit || judged >= maxCandidates) return done(false);
+				judged++;
+				await consider(space);
+			}
+			const last = rows[rows.length - 1];
+			if (rows.length < page || !last) break;
+			afterId = last.id;
+		}
+	}
+	return done(true);
 }

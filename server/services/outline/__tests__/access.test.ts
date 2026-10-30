@@ -118,7 +118,7 @@ afterEach(() => {
 });
 
 describe("the access matrix on SQLite", () => {
-	for (const group of ["spaces", "person", "session", "cap", "list"] as const) {
+	for (const group of ["spaces", "person", "session", "cap", "list", "listing", "agent"] as const) {
 		test(group, async () => {
 			const selected = cases().filter((testCase) => testCase.group === group);
 			expect(selected.length).toBeGreaterThan(0);

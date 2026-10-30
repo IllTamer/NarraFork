@@ -10,10 +10,22 @@
  *   ‹facts only: 6 blocks under tasks not shown; read with view "all" to include them›
  *
  * The first line names the space once (its key and what it is) and where the block sits. Every
- * block line carries the block's short id right after the bullet; within the space that is its
- * address, elsewhere `key/sid`. Links show their targets' current titles where the session may
- * read them (`link-display.ts`). Lines in `‹…›` are notes, never content: an edit that copies a
- * read back drops them, and drops the ids again (`edit-text.ts`).
+ * block line carries the block's address right after the bullet: its short id in one of the
+ * session's own spaces (where a bare id is looked up), `key/sid` in any other space it may read.
+ * Links show their targets' current titles where the session may read them (`link-display.ts`);
+ * a link to anything else shows no title, whether its target is unreadable or does not exist,
+ * and is never expanded. Lines in `‹…›` are notes, never content: an edit that copies a read
+ * back drops them, and drops the ids again (`edit-text.ts`).
+ *
+ * READING ACROSS SPACES
+ * ---------------------
+ * Every space the session may read (`session-scope.ts`) can be read and searched: by key,
+ * through the overview of all of them (`OutlineRead` with address `*`: each space's pages,
+ * expanded level by level within one budget, the session's own spaces first), or by searching
+ * them all (`OutlineSearch` with spaces `["*"]`; the readable set goes into the SQL filter before
+ * the result limit). A space it may not read is never named, listed or searched, and a reference
+ * into one gets exactly the answer a reference to nothing gets. Reads of other spaces are
+ * recorded in the read ledger like any other; only writes stay in the session's own spaces.
  *
  * The output is bounded by the read's budget, so the agent loop must not cut it again (its cut
  * keeps the tail and would lose the top of the outline).
@@ -21,14 +33,21 @@
 import { blockTitle, serializeMarkdownOutline, TASK_BOX } from "@shared/outline";
 import { type OutlineAgentScope, spaceRootName } from "./agent-scope";
 import { LINK_DISPLAY_LIMITS, linkTitles, withLinkTitles } from "./link-display";
-import { OUTLINE_TOOL_TEXT } from "./messages";
-import { commitSeqAt, readOutline } from "./read";
+import { OUTLINE_LISTED_NAMES, OUTLINE_TOOL_TEXT } from "./messages";
+import { commitSeqAt, loadBodiesWithin, readOutline } from "./read";
 import { recordOutlineReads } from "./read-ledger";
-import { OUTLINE_READ_LIMITS, type OutlineDisplay, outlineItem } from "./render";
+import {
+	clampBudget,
+	OUTLINE_READ_LIMITS,
+	type OutlineDisplay,
+	type OutlineRenderSection,
+	outlineItem,
+	renderOutlineSections,
+} from "./render";
 import type { OutlineResolvedBlock } from "./resolve";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "./search";
-import type { OutlineSpaceRow } from "./store/port";
-import type { OutlineNode, OutlineView } from "./tree";
+import type { OutlineBlockRow, OutlineSpaceRow } from "./store/port";
+import { breadthFirstForest, buildTree, type OutlineNode, type OutlineView } from "./tree";
 
 /** A tool's answer before it becomes a `ToolResult`. */
 export interface OutlineToolOutput {
@@ -41,16 +60,30 @@ export interface OutlineToolOutput {
 }
 
 export const OUTLINE_AGENT_READ_LIMITS = {
-	/** Pages listed per space when a space is read as a whole. */
+	/** Pages listed per space when a space is read as a whole, or taken into the overview. */
 	maxPagesListed: 100,
 	/** UTF-8 bytes of rendered text per block of budget, between the default and the maximum. */
 	bytesPerBlock: 256,
 	/** Characters of a title in a header, a path or a page list. */
 	titleChars: 100,
+	/** Spaces the overview of every readable space covers. */
+	overviewSpaces: 50,
+	/** Blocks of one page the overview loads; a larger page is shown without what is under it. */
+	overviewPageBlocks: 500,
+	/** Blocks the overview loads in all; pages past that are not taken. */
+	overviewBlocks: 5000,
+	/** Spaces a search of every readable space covers. */
+	searchAllSpaces: 100,
 } as const;
 
+/** The address that reads the overview of every space the session may read. */
+export const OUTLINE_ALL_SPACES = "*";
+
 export interface OutlineReadInput {
-	/** A block or page; `key/` (or `project/`, `session/`, `personal/`) lists a space's pages. */
+	/**
+	 * A block or page; `key/` (or `project/`, `session/`, `personal/`) lists a space's pages;
+	 * `*` is the overview of every space the session may read.
+	 */
 	address?: string;
 	view?: OutlineView;
 	/** Blocks to show at most. */
@@ -61,7 +94,7 @@ export interface OutlineReadInput {
 
 export interface OutlineSearchInput {
 	query: string;
-	/** Space keys or words; the session's own spaces by default. */
+	/** Space keys or words, `*` for every readable space; the session's own spaces by default. */
 	spaces?: string[];
 	limit?: number;
 }
@@ -105,9 +138,10 @@ async function pageLines(
 	const rows = await scope.store.listChildren(space.id, null, limit + 1);
 	const pages = rows.slice(0, limit);
 	// Only titles, clipped: not a read of the pages (their edits need one).
+	const label = scope.labelIn(space);
 	const lines = pages.map((page) => {
 		const box = page.taskJson ? `[${TASK_BOX[page.taskJson.status]}] ` : "";
-		return `- [${page.sid}] ${box}${clip(blockTitle(page.content)) || OUTLINE_TOOL_TEXT.untitled}`;
+		return `- ${label(page.sid)} ${box}${clip(blockTitle(page.content)) || OUTLINE_TOOL_TEXT.untitled}`;
 	});
 	return { lines, more: rows.length > limit, count: pages.length };
 }
@@ -148,6 +182,151 @@ async function readOverview(scope: OutlineAgentScope): Promise<OutlineToolOutput
 		output: lines.join("\n"),
 		title: "OutlineRead",
 		metadata: { tool: "OutlineRead", spaces },
+	};
+}
+
+/** A page tree's node for a block row, content not loaded yet (its tags load with it). */
+function pageNode(row: OutlineBlockRow): OutlineNode {
+	return {
+		id: row.id,
+		sid: row.sid,
+		parentId: null,
+		orderKey: row.orderKey,
+		alias: row.alias,
+		task: row.taskJson,
+		versionSeq: row.versionSeq,
+		parent: null,
+		children: [],
+		content: null,
+		tags: null,
+	};
+}
+
+/**
+ * `OutlineRead` with address `*`: every space the session may read (its own first, at most
+ * {@link OUTLINE_AGENT_READ_LIMITS.overviewSpaces}), each with its pages expanded together,
+ * level by level, within the read's budget (`renderOutlineSections`). Facts only by default.
+ *
+ * Bounded before the budget: pages are taken only as far as the budget could show them, each
+ * page's structure is read up to {@link OUTLINE_AGENT_READ_LIMITS.overviewPageBlocks} blocks (a
+ * larger page shows without what is under it) and the overview as a whole up to
+ * {@link OUTLINE_AGENT_READ_LIMITS.overviewBlocks}; content is loaded only for what fits. What
+ * it shows is a read: recorded in the ledger, links titled where the session may read them.
+ */
+async function readAllSpaces(
+	scope: OutlineAgentScope,
+	input: OutlineReadInput,
+): Promise<OutlineToolOutput> {
+	const meta: Record<string, unknown> = { tool: "OutlineRead", address: OUTLINE_ALL_SPACES };
+	if (input.asOf !== undefined) {
+		return { output: OUTLINE_TOOL_TEXT.overviewNotAsOf, isError: true, metadata: meta };
+	}
+	const limits = OUTLINE_AGENT_READ_LIMITS;
+	const { spaces, complete } = await scope.readableSpaces(limits.overviewSpaces);
+	if (spaces.length === 0) {
+		return {
+			output: OUTLINE_TOOL_TEXT.allSpacesNone,
+			title: "OutlineRead: *",
+			metadata: { ...meta, spaces: [], complete },
+		};
+	}
+	const view: OutlineView = input.view ?? "facts";
+	const budget = clampBudget(budgetOf(input.budget));
+	const context = await scope.contextSpace();
+	let pagesLeft = budget.blocks;
+	let blocksLeft = limits.overviewBlocks;
+	let taskPages = 0;
+	let anyOther = false;
+	let cut = !complete;
+	const sections: OutlineRenderSection[] = [];
+	const roots: OutlineNode[] = [];
+	const spaceMeta: Array<Record<string, unknown>> = [];
+	for (const { space, word } of spaces) {
+		const own = scope.isOwnSpace(space);
+		if (!own) anyOther = true;
+		const label = scope.labelIn(space);
+		const want = Math.min(limits.maxPagesListed, pagesLeft);
+		const listed = await scope.store.listSpacePages(space.id, { limit: want + 1 });
+		const pages = listed.slice(0, want);
+		pagesLeft -= pages.length;
+		let morePages = listed.length > want;
+		const sectionRoots: OutlineNode[] = [];
+		const alone: string[] = [];
+		for (const page of pages) {
+			if (view === "facts" && page.isTask) {
+				taskPages++;
+				continue;
+			}
+			if (blocksLeft <= 0) {
+				morePages = true;
+				continue;
+			}
+			const structure = await scope.store.listPageStructure(page.id, {
+				asOf: null,
+				limit: Math.min(limits.overviewPageBlocks, blocksLeft),
+			});
+			blocksLeft -= structure.rows.length;
+			if (structure.truncated) {
+				const row = await scope.store.getBlock(page.id);
+				if (!row || row.deleted || row.parentId !== null) continue;
+				sectionRoots.push(pageNode(row));
+				alone.push(label(row.sid));
+				continue;
+			}
+			const root = buildTree(structure.rows).get(page.id);
+			if (root && root.parentId === null) sectionRoots.push(root);
+		}
+		const footer: string[] = [];
+		if (listed.length === 0) footer.push(note(OUTLINE_TOOL_TEXT.noPages));
+		if (alone.length > 0) footer.push(note(OUTLINE_TOOL_TEXT.notExpanded(alone)));
+		if (morePages) footer.push(note(OUTLINE_TOOL_TEXT.morePagesOf(space.key)));
+		cut ||= morePages || alone.length > 0;
+		sections.push({
+			header: [
+				note(OUTLINE_TOOL_TEXT.spaceSection(await scope.describe(space), space.id === context?.id)),
+			],
+			roots: sectionRoots,
+			label: (node) => label(node.sid),
+			footer,
+		});
+		roots.push(...sectionRoots);
+		spaceMeta.push({ key: space.key, kind: space.kind, word, own, pages: pages.length });
+	}
+
+	const state = { current: true, seq: 0 };
+	const order = breadthFirstForest(roots, view, budget.blocks);
+	await loadBodiesWithin(state, order, budget.bytes, { store: scope.store });
+	const seen = new Map<string, number>();
+	const display = await displayFor(scope, seen)(
+		state,
+		order.filter((node) => node.content !== null),
+	);
+	const notes: string[] = [];
+	if (taskPages > 0) notes.push(note(OUTLINE_TOOL_TEXT.taskPagesHidden(taskPages)));
+	if (!complete) notes.push(note(OUTLINE_TOOL_TEXT.moreSpaces));
+	if (anyOther) notes.push(note(OUTLINE_TOOL_TEXT.otherSpacesReadOnly));
+	const rendered = renderOutlineSections(sections, { view, budget, display, notes });
+	recordOutlineReads(
+		scope.narratorId,
+		rendered.blockIds.flatMap((id) => {
+			const version = seen.get(id);
+			return version === undefined ? [] : [[id, version] as const];
+		}),
+	);
+	return {
+		output: `${note(OUTLINE_TOOL_TEXT.allSpacesHeader(spaces.length))}\n${rendered.markdown}`,
+		title: "OutlineRead: *",
+		bounded: true,
+		metadata: {
+			...meta,
+			spaces: spaceMeta,
+			complete,
+			view: rendered.view,
+			blocks: rendered.blockIds.length,
+			hiddenByBudget: rendered.hiddenByBudget,
+			hiddenByView: rendered.hiddenByView + taskPages,
+			truncated: cut || rendered.hiddenByBudget > 0,
+		},
 	};
 }
 
@@ -270,6 +449,7 @@ export async function outlineRead(
 ): Promise<OutlineToolOutput> {
 	const address = input.address?.trim() ?? "";
 	if (address === "") return await readOverview(scope);
+	if (address === OUTLINE_ALL_SPACES) return await readAllSpaces(scope, input);
 	const root = spaceRootName(address);
 	if (root !== null) return await readSpace(scope, root);
 
@@ -312,12 +492,13 @@ export async function outlineRead(
 		asOf = seq;
 	}
 	const seen = new Map<string, number>();
+	const label = scope.labelIn(space);
 	const result = await readOutline({
 		blockId: block.id,
 		view: input.view,
 		budget: budgetOf(input.budget),
 		asOf,
-		label: (node) => `[${node.sid}]`,
+		label: (node) => label(node.sid),
 		display: displayFor(scope, seen),
 	});
 	if (!result) {
@@ -375,15 +556,27 @@ export async function outlineSearch(
 	const query = input.query.trim();
 	const spaces: OutlineSpaceRow[] = [];
 	const unknown: string[] = [];
-	if (input.spaces && input.spaces.length > 0) {
-		for (const raw of input.spaces) {
+	const ownOnly = !input.spaces || input.spaces.length === 0;
+	let incomplete = false;
+	const take = (space: OutlineSpaceRow) => {
+		if (!spaces.some((s) => s.id === space.id)) spaces.push(space);
+	};
+	if (!ownOnly) {
+		for (const raw of input.spaces ?? []) {
 			const name = raw.trim().replace(/\/$/, "");
+			if (name === OUTLINE_ALL_SPACES) {
+				// Every readable space, listed before the search: the set goes into its SQL filter.
+				const all = await scope.readableSpaces(OUTLINE_AGENT_READ_LIMITS.searchAllSpaces);
+				for (const { space } of all.spaces) take(space);
+				incomplete ||= !all.complete;
+				continue;
+			}
 			const space = await scope.space(name);
-			if (space) spaces.push(space);
+			if (space) take(space);
 			else unknown.push(raw);
 		}
 	} else {
-		for (const own of await scope.ownSpaces()) spaces.push(own.space);
+		for (const own of await scope.ownSpaces()) take(own.space);
 	}
 	const keys = spaces.map((space) => space.key);
 	if (spaces.length === 0) {
@@ -409,9 +602,14 @@ export async function outlineSearch(
 		contextSpaceId: scope.session?.id ?? null,
 		limit,
 	});
+	// The header names the first few spaces and counts the rest (a search of every readable
+	// space covers up to a hundred): only those are described.
 	const described: string[] = [];
-	for (const space of spaces) described.push(await scope.describe(space));
+	for (const [i, space] of spaces.entries()) {
+		described.push(i < OUTLINE_LISTED_NAMES ? await scope.describe(space) : space.key);
+	}
 	const lines = [note(OUTLINE_TOOL_TEXT.searchHeader(hits.length, query, described))];
+	if (incomplete) lines.push(note(OUTLINE_TOOL_TEXT.searchedSome(spaces.length)));
 	if (unknown.length > 0) lines.push(note(OUTLINE_TOOL_TEXT.spacesNotSearched(unknown)));
 	for (const hit of hits) {
 		const alias = hit.alias ? OUTLINE_TOOL_TEXT.aliasMark(hit.alias) : "";
@@ -432,7 +630,9 @@ export async function outlineSearch(
 			lines.push(`  “${hit.snippet}”`);
 		}
 	}
-	if (hits.length === 0) lines.push(OUTLINE_TOOL_TEXT.noResults);
+	if (hits.length === 0) {
+		lines.push(ownOnly ? OUTLINE_TOOL_TEXT.noResultsOwn : OUTLINE_TOOL_TEXT.noResults);
+	}
 	return {
 		output: lines.join("\n"),
 		title: `OutlineSearch: ${clip(query, 60)}`,
@@ -440,6 +640,7 @@ export async function outlineSearch(
 			tool: "OutlineSearch",
 			query,
 			spaces: keys,
+			...(incomplete ? { complete: false } : {}),
 			resultCount: hits.length,
 			results: hits.map((hit) => ({
 				address: hit.address,

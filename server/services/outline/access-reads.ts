@@ -17,7 +17,8 @@
  * working-directory link index lives in SQLite so far.
  *
  * The space listing reuses the dialect-neutral readability predicates of `read/acl-sql.ts`, the
- * same text the project and narrator list queries are built from.
+ * same text the project and narrator list queries are built from; so does the candidate listing
+ * a session's readable spaces are judged from (`session-scope.ts`).
  *
  * THE EXECUTOR
  * ------------
@@ -387,6 +388,88 @@ export async function readReadableSpacePage(
 		from outline_spaces s
 		where ${visible}
 			${options.kind ? sql`and s.kind = ${options.kind}` : sql``}
+			${options.afterId !== undefined ? sql`and ${id} > ${options.afterId}` : sql``}
+		order by ${id}
+		limit ${options.limit}
+	`);
+	return rows.map(toSpace);
+}
+
+/**
+ * Where the spaces a session might read are looked for (`session-scope.ts` judges each one):
+ *
+ *   - `reader`: what one person reads, by the predicates {@link readReadableSpacePage} uses,
+ *     plus what a grant to the `user` role opens (those predicates read user grants only);
+ *   - `open`: project spaces every signed-in user can read (public, or granted to the `user`
+ *     role); never a session space;
+ *   - `all`: every space of the kind with an owner left (sessions only admins read).
+ */
+export type OutlineSpaceCandidates =
+	| { kind: "reader"; userId: string }
+	| { kind: "open" }
+	| { kind: "all" };
+
+/** A project every signed-in user can read: the rule of `projectOpenToEveryone`. */
+function openProjectText(projectAlias: string): string {
+	return `(
+		${projectAlias}.visibility = 'public'
+		or exists (
+			select 1 from acl_grants rg
+			where rg.scope_type = 'project' and rg.scope_id = ${projectAlias}.id
+				and rg.domain_kind is null and rg.principal_type = 'role' and rg.principal_id = 'user'
+				and rg.capability in ('read','write','manage')
+		)
+	)`;
+}
+
+/** A narrator every signed-in user may read by a grant to the `user` role (past its gate). */
+function roleGrantedNarratorText(narratorIdExpression: string): string {
+	return `exists (
+		select 1 from acl_grants rg
+		where rg.scope_type = 'narrator' and rg.scope_id = ${narratorIdExpression}
+			and rg.domain_kind is null and rg.principal_type = 'role' and rg.principal_id = 'user'
+			and rg.capability in ('read','write')
+	)`;
+}
+
+/**
+ * A page of project or session spaces a session might read, in id order after `afterId`:
+ * candidates only, a superset of what the session reads (or, where the per-person predicates
+ * miss a rule, a little less). The filter runs in SQL, before the LIMIT.
+ */
+export async function readSpaceCandidatePage(
+	from: OutlineSpaceCandidates,
+	options: { kind: "project" | "session"; afterId?: string; limit: number },
+): Promise<OutlineSpaceRow[]> {
+	const pg = executor().dialect === "postgres";
+	const id = pg ? sql.raw(`s.id collate "C"`) : sql.raw("s.id");
+	let filter: SQL;
+	if (options.kind === "project") {
+		const open = sql.raw(
+			`exists (select 1 from projects op where op.id = s.project_id and ${openProjectText("op")})`,
+		);
+		filter =
+			from.kind === "all"
+				? sql`s.project_id is not null`
+				: from.kind === "open"
+					? open
+					: sql`(${bindPlaceholders(projectReadableForIdText("s.project_id"), from.userId)} or ${open})`;
+	} else {
+		if (from.kind === "open") return [];
+		filter =
+			from.kind === "all"
+				? sql`s.narrator_id is not null`
+				: sql`(exists (
+						select 1 from narrators n
+						where n.id = s.narrator_id
+							and ${bindPlaceholders(narratorReadableText("n"), from.userId)}
+					) or ${sql.raw(roleGrantedNarratorText("s.narrator_id"))})`;
+	}
+	const rows = await all(sql`
+		select s.id, s.key, s.kind, s.project_id, s.narrator_id, s.owner_user_id, s.next_seq,
+			s.created_at
+		from outline_spaces s
+		where s.kind = ${options.kind} and ${filter}
 			${options.afterId !== undefined ? sql`and ${id} > ${options.afterId}` : sql``}
 		order by ${id}
 		limit ${options.limit}

@@ -1,6 +1,7 @@
 /**
- * The outline tools: `OutlineRead` and `OutlineSearch` (core, read-only) and `OutlineEdit`
- * (optional, loaded with its routine). The work lives in `server/services/outline/agent-*.ts`,
+ * The outline tools: `OutlineRead` and `OutlineSearch` (core, read-only, across every space the
+ * session may read) and `OutlineEdit` (optional, loaded with its routine; the session's own
+ * spaces only). The work lives in `server/services/outline/agent-*.ts`,
  * loaded on first use; this module holds the schemas, the descriptions and what only a tool call
  * knows: the turn's person, the session's permission mode and the call's provenance.
  *
@@ -137,19 +138,19 @@ async function failure(error: unknown, tool: string): Promise<ToolResult> {
 
 export const outlineReadTool: ToolDefinition = {
 	name: OUTLINE_READ_TOOL,
-	description: `Read the outline (the team's shared, versioned notes: pages of nested blocks). Returns a page or any block with what is under it as a markdown outline, expanded level by level within a budget.
-- Every line starts with the block's id: \`- [Ab3dEf9Q] text\`, \`- [Ab3dEf9Q] [ ] a task @agent:name\`. The first line names the space (its key, e.g. Kx81mPqa). Within that space the id is the block's address; from elsewhere write key/id. Links show their target's current title: [[Kx81mPqa/Ab3dEf9Q|Title]].
+	description: `Read the outline (the team's shared, versioned notes: pages of nested blocks in spaces: this session's project, its own notes, your personal space, and the other projects' and sessions' spaces this session may read). Returns a page or any block with what is under it as a markdown outline, expanded level by level within a budget.
+- Every line starts with the block's address: \`- [Ab3dEf9Q] text\`, \`- [Ab3dEf9Q] [ ] a task @agent:name\`. The first line names the space (its key, e.g. Kx81mPqa). In this session's own spaces (its project's, its notes, the personal space) the id alone is the address; blocks of any other space are labeled key/id (\`- [Lm29XkQa/Ab3dEf9Q] text\`), which is how to address them. Links show their target's current title: [[Kx81mPqa/Ab3dEf9Q|Title]]; a link without a title points to something this session cannot read, or to nothing.
 - Lines in ‹…› are notes, not content: ‹… 12 more› means blocks left out by the budget (raise budget, or read that block).
 - A page shows facts by default: tasks and everything under them are left out (view "all" includes them; reading a task shows all of it).
-- address: an id, key/id, an alias such as Q17, or a block's title. Omit it to list this session's spaces and their pages; key/ (or project/, session/, personal/) lists one space's pages.
+- address: an id, key/id, an alias such as Q17, or a block's title (ids, aliases and titles alone are looked up in this session's own spaces). Omit it to list this session's own spaces and their pages; key/ (or project/, session/, personal/) lists one space's pages; "*" is an overview of every space this session can read, its own first, each with its pages expanded together within the budget.
 - asOf: a commit number or a time, to read the block as it was then.
-To write, use OutlineEdit (copy what you read into it: the ids and ‹…› notes are dropped).`,
+To write, use OutlineEdit (copy what you read into it: the ids and ‹…› notes are dropped). It writes only this session's own spaces; the others are read only.`,
 	parameters: z.object({
 		address: z
 			.string()
 			.optional()
 			.describe(
-				"Block or page: an id, key/id, an alias or a title. Omit to list this session's spaces; key/ lists a space's pages",
+				"Block or page: an id, key/id, an alias or a title. Omit to list this session's spaces; key/ lists a space's pages; \"*\" is an overview of every space this session can read",
 			),
 		view: z
 			.enum(["facts", "all"])
@@ -188,13 +189,15 @@ To write, use OutlineEdit (copy what you read into it: the ids and ‹…› not
 export const outlineSearchTool: ToolDefinition = {
 	name: OUTLINE_SEARCH_TOOL,
 	description: `Search the outline by words (full text over block content, titles and aliases). Returns up to 50 blocks, best matches first and facts before process (tasks, what is under them, session notes), each with its address [key/id], where it sits and a snippet. Read a result with OutlineRead.
-Searches this session's spaces by default (its project's, its own notes, and the personal space where available); spaces names others by key.`,
+Searches this session's own spaces by default (its project's, its own notes, and the personal space where available); spaces names others by key, and ["*"] searches every space this session can read.`,
 	parameters: z.object({
 		query: z.string().describe("Words to look for"),
 		spaces: z
 			.array(z.string())
 			.optional()
-			.describe("Space keys (or project, session, personal) to search instead of the default"),
+			.describe(
+				'Space keys (or project, session, personal; "*" for every space this session can read) to search instead of the default',
+			),
 		limit: looseNumber("Results at most (default 20, max 50)"),
 	}),
 	isAvailable: outlineEnabled,
@@ -318,7 +321,7 @@ function editRequest(edit: EditInput, n: number): EditRequest | string {
 
 export const outlineEditTool: ToolDefinition = {
 	name: OUTLINE_EDIT_TOOL,
-	description: `Write to the outline. One call is one commit in one space: all edits apply, or none does. Every commit records who wrote it and can be reverted.
+	description: `Write to the outline. One call is one commit in one space: all edits apply, or none does. Every commit records who wrote it and can be reverted. Only this session's own spaces are written (its project's, its notes, the personal space); other spaces it reads are read only: link to their blocks as [[key/id]].
 edits, in order, each one of:
 - { add: <parent>, markdown, after? }: add blocks written as a markdown outline under a block, or as new pages with key/ (or project/, session/, personal/), or "/" for this session's project space (its own notes when it may not write the project's). after: the sibling to place them after (default: last).
 - { replace: <block>, text }: the block's new text, written like one outline item without its bullet. A checkbox, @assignee and key:: lines in it are applied, whatever you leave out keeps its value, indented items become child blocks.
