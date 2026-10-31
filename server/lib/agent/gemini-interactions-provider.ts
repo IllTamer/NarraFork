@@ -28,6 +28,7 @@ import {
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { stringifyRequestBody } from "./request-json";
 import { parseJsonTextWithBody } from "./response-body";
 import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -279,8 +280,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			stream: true,
 		});
 		await reportInputCharacters(params, body);
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, params.signal);
 
 		const url = `${this.baseUrl()}/interactions`;
 		const headers = this.headers(true, params.conversationId);
@@ -482,8 +482,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			reasoningEffort: options.reasoningEffort,
 			stream: true,
 		});
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, options.signal);
 		const response = await this.pfetch(`${this.baseUrl()}/interactions`, {
 			method: "POST",
 			headers: this.headers(true),

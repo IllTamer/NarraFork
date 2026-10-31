@@ -72,25 +72,13 @@ export function resolveHistoryToolLoadingStrategy(
 	return resolveAdapterToolLoadingStrategy(resolved.adapter, resolved.model);
 }
 
-/** How long an Anthropic prompt cache entry certainly lives (the default 5-minute tier). */
-const ANTHROPIC_CACHE_TTL_MS = 5 * 60_000;
-
-/**
- * The target a request for `model` on `provider` goes to, for epoch boundaries
- * (docs/BLOCK_STORAGE-DESIGN.md §7.7): the routed model with the tool loading strategy
- * it implies, and how long its prompt cache certainly lives (null when unknown).
- */
+/** Cache age and tool strategy are not model identity and never open an epoch. */
 export function resolveEpochTarget(
 	model: string,
 	provider: string,
 ): { fingerprint: string; cacheTtlMs: number | null } {
 	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
-	const strategy = resolveAdapterToolLoadingStrategy(resolved.adapter, resolved.model);
-	const protocol = resolved.adapter.toolLoadingTarget?.(resolved.model)?.protocol;
-	return {
-		fingerprint: `${resolved.model}#${strategy}`,
-		cacheTtlMs: protocol === "anthropic-messages" ? ANTHROPIC_CACHE_TTL_MS : null,
-	};
+	return { fingerprint: `${resolved.provider}:${resolved.model}`, cacheTtlMs: null };
 }
 
 /**
