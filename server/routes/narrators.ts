@@ -1925,7 +1925,7 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 				options.onReasoningDelta,
 				undefined,
 				undefined,
-				{ responseFormat },
+				{ responseFormat, onGenerationProgress: options.onGenerationProgress },
 			),
 		settings.agent.firstTokenTimeoutMs,
 		c.req.raw.signal,
@@ -1937,10 +1937,7 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	});
 
 	if (generated.responseFormatDegraded) {
-		// Not an error: the fallback path below still produces a usable prompt, but
-		// structure was not honoured, so no reasoning summary can be reported. Warn
-		// rather than debug — this is the difference the user sees as "no summary
-		// popup", and it must be findable in the log when it happens.
+		// Log loss of native schema enforcement; validated fields remain usable.
 		logger.warn("Prompt optimize fell back to text parsing", {
 			narratorId,
 			model,
@@ -1948,12 +1945,16 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 		});
 	}
 
-	// Structured first (whitelisted fields only), text second. Both go through the
-	// same normalizer so the two paths cannot produce differently packaged output.
-	// The summary never enters the text path: it is presentation only.
 	const structured = readOptimizeResult(generated.structured);
-	const result = normalizeOptimizedPrompt(structured?.optimizedPrompt ?? generated.text, text);
-	// A degraded response must not claim a summary — the text path cannot know one.
+	// Failed or incomplete schema output is not prompt text. Keep the draft rather
+	// than leaking the raw JSON envelope (or a partial rewrite) into the composer.
+	if (generated.outputTruncated || (generated.structured !== undefined && !structured)) {
+		return c.json({ text, model });
+	}
+	// The validated field is already the payload; only plaintext fallback needs
+	// wrapper removal. Its examples, headings and literal thinking tags are content.
+	const result = structured?.optimizedPrompt ?? normalizeOptimizedPrompt(generated.text, text);
+	if (!structured && result.startsWith("{")) return c.json({ text, model });
 	const reasoningSummary = structured?.reasoningSummary ?? generated.reasoningSummary;
 
 	return c.json({ text: result, model, ...(reasoningSummary ? { reasoningSummary } : {}) });

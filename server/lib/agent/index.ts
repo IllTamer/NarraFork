@@ -468,7 +468,7 @@ export async function summaryGenerate(
 	 * delta callbacks keep their dedicated slots so retries and progress stay
 	 * connected to the caller's request.
 	 */
-	extraOptions?: Partial<Pick<GenerateOptions, "responseFormat">>,
+	extraOptions?: Partial<Pick<GenerateOptions, "responseFormat" | "onGenerationProgress">>,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	// Retries belong to the original invocation, even if the caller reuses its options.

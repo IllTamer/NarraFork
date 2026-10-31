@@ -30,6 +30,15 @@
  * to that narrator. Nothing is lost, and no other narrator's input is touched.
  */
 
+import type { ComposerDocument } from "@shared/composer-document";
+
+/** The document, selection and segment markers the request was created for. */
+export interface PromptOptimizeSnapshot {
+	document: ComposerDocument;
+	selection: { start: number; end: number };
+	token: string;
+}
+
 /** Styles the optimizer can be asked for. Owned here so the store has no React deps. */
 export type OptimizeStyle = "clarify" | "concise" | "structured" | "translate_en";
 
@@ -47,6 +56,7 @@ export interface PromptOptimizeTask {
 	finishedAt?: number;
 	/** The draft the request was issued against; delivery refuses if it has moved on. */
 	originalText: string;
+	snapshot?: PromptOptimizeSnapshot;
 	resultText?: string;
 	/** Short rationale lifted by the server, shown beside the result. */
 	summary?: string;
@@ -158,6 +168,7 @@ export interface StartPromptOptimizeParams {
 	narratorId: string;
 	messageId?: string;
 	text: string;
+	snapshot?: PromptOptimizeSnapshot;
 	style: OptimizeStyle;
 	withContext: boolean;
 	/** Injected so tests can drive the task without the network. */
@@ -195,6 +206,7 @@ export function startPromptOptimizeTask(params: StartPromptOptimizeParams): stri
 		requestId,
 		startedAt: now,
 		originalText: params.text,
+		snapshot: params.snapshot,
 		pendingDelivery: false,
 	};
 	tasks.set(key, task);

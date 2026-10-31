@@ -180,6 +180,8 @@ export interface GenerateOptions {
 	 * contract as `onTextDelta`: deltas only, keep it lightweight.
 	 */
 	onReasoningDelta?: (delta: string) => void | Promise<void>;
+	/** Actual model output outside text/reasoning (e.g. tool arguments), never transport heartbeats. */
+	onGenerationProgress?: () => void | Promise<void>;
 	/**
 	 * Constrain the output channel to a JSON Schema.
 	 *

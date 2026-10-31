@@ -1,9 +1,11 @@
 import { logger } from "../logger";
 import type { ResponseFormat } from "./provider";
+import { ApiError } from "./types";
+import { parseUnsupportedParameter } from "./unsupported-parameter-fallback";
 
 /**
- * Fallback for relays that claim to accept a JSON-Schema output constraint but
- * ignore it.
+ * Fallback for relays that explicitly reject a JSON-Schema output constraint
+ * or accept the request but ignore the constraint.
  *
  * Observed on relayed OpenAI-Responses-compatible endpoints (e.g. `geek2api`
  * serving `deepseek-v4.1-flash`): the request carries `text.format`, the call
@@ -25,7 +27,21 @@ import type { ResponseFormat } from "./provider";
  * malformed output impossible; an instruction makes it merely unlikely.
  */
 
-/** Models known to accept but ignore a native structured-output constraint. */
+/** Only an explicit capability rejection of the sent format warrants a retry. */
+export function isStructuredOutputRejection(
+	error: unknown,
+	parameter: "response_format" | "text.format",
+): boolean {
+	if (!(error instanceof ApiError) || error.status !== 400) return false;
+	if (parseUnsupportedParameter(error.message) === parameter) return true;
+	const field = parameter.replace(".", "\\.");
+	return new RegExp(
+		`\\b${field}["']?(?:\\s+of type\\s+["']?json_schema["']?)?\\s+(?:is\\s+)?not supported\\b`,
+		"i",
+	).test(error.message);
+}
+
+/** Models known to reject or ignore a native structured-output constraint. */
 const lacksNativeStructuredOutput = new Set<string>();
 
 /**
@@ -58,7 +74,7 @@ export function modelLacksNativeStructuredOutput(relayKey: string): boolean {
 }
 
 /**
- * Record that a relay ignored a native structured constraint.
+ * Record that a relay rejected or ignored a native structured constraint.
  *
  * Per-process and in-memory on purpose: it only ever saves a wasted first
  * attempt, so losing it on restart costs one extra request, while persisting it
@@ -73,7 +89,7 @@ export function rememberMissingNativeStructuredOutput(relayKey: string): void {
 		if (!oldest.done) lacksNativeStructuredOutput.delete(oldest.value);
 	}
 	lacksNativeStructuredOutput.add(relayKey);
-	logger.warn("Relay ignored the structured-output constraint; downgrading to a text instruction", {
+	logger.warn("Relay rejected or ignored structured output; downgrading to a text instruction", {
 		relay: relayKey,
 	});
 }

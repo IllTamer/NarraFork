@@ -10,10 +10,14 @@
  * The registry has its own tests for the transport and delivery-ownership rules.
  */
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import type { ComposerDocument } from "@shared/composer-document";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { composerOptimizeTarget } from "../components/narrator/composer/composer-optimize-target";
+import type { InlineComposerEditorHandle } from "../components/narrator/composer/InlineComposerEditor";
 import {
+	getPromptOptimizeTask,
 	isNarratorOptimizingPrompt,
 	resetPromptOptimizeTasksForTest,
 	startPromptOptimizeTask,
@@ -31,6 +35,7 @@ let root: Root;
 let result: ReturnType<typeof usePromptOptimize>;
 let applied: string[];
 let requests: {
+	text: string;
 	signal: AbortSignal;
 	resolve: (value: { text: string; reasoningSummary?: string }) => void;
 	reject: (error: Error) => void;
@@ -75,6 +80,7 @@ beforeEach(async () => {
 		(_id, _text, _style, options) =>
 			new Promise((resolve, reject) =>
 				requests.push({
+					text: _text,
 					signal: options?.signal as AbortSignal,
 					resolve: (value) => resolve({ ...value, model: "test" }),
 					reject,
@@ -371,12 +377,14 @@ test("remounting the composer of a running narrator restores loading", async () 
  */
 test("a fresh composer adopts a running optimization started by another instance", async () => {
 	// Somebody else (the previous mount) started the narrator's optimization.
-	startPromptOptimizeTask({
-		narratorId: "n",
-		text: "original",
-		style: "clarify",
-		withContext: false,
-		request: () => new Promise(() => {}),
+	await act(async () => {
+		startPromptOptimizeTask({
+			narratorId: "n",
+			text: "original",
+			style: "clarify",
+			withContext: false,
+			request: () => new Promise(() => {}),
+		});
 	});
 	expect(isNarratorOptimizingPrompt("n")).toBe(true);
 
@@ -415,4 +423,207 @@ test("an inline message edit does not make the composer toolbar look busy", asyn
 	// The narrator is still shown as busy in the sidebar — that indicator counts any
 	// optimization for the narrator.
 	expect(isNarratorOptimizingPrompt("n")).toBe(true);
+});
+
+function richEditor(...paragraphs: string[]) {
+	let document: ComposerDocument = {
+		version: 1,
+		paragraphs: paragraphs.map((text) => ({ children: [{ type: "text", text }] })),
+		assets: [],
+	};
+	let selection = { start: 0, end: 0 };
+	return {
+		handle: {
+			getElement: () => globalThis.document.createElement("div"),
+			getDocument: () => document,
+			getSelection: () => selection,
+			setDocument: (next: ComposerDocument) => {
+				document = next;
+			},
+		} as InlineComposerEditorHandle,
+		getDocument: () => document,
+		select: (start: number, end: number) => {
+			selection = { start, end };
+		},
+	};
+}
+
+function RichProbe({
+	editor,
+	ready = true,
+}: {
+	editor: InlineComposerEditorHandle;
+	ready?: boolean;
+}) {
+	result = usePromptOptimize({
+		narratorId: renderNarratorId,
+		ready,
+		textareaRef: { current: null },
+		target: (snapshot) => composerOptimizeTarget(editor, snapshot),
+	});
+	return null;
+}
+
+test("rich multi-paragraph results use the original segment markers", async () => {
+	const editor = richEditor("alpha", "beta");
+	await act(async () => root.render(<RichProbe editor={editor.handle} />));
+	await act(async () => result.handleOptimize("clarify"));
+	await flush();
+	const response = requests[0].text.replace("alpha", "ALPHA").replace("beta", "BETA");
+	await act(async () => requests[0].resolve({ text: response }));
+	expect(editor.getDocument().paragraphs).toEqual([
+		{ children: [{ type: "text", text: "ALPHA" }] },
+		{ children: [{ type: "text", text: "BETA" }] },
+	]);
+	expect(notifications.show).toHaveBeenCalledWith(
+		expect.objectContaining({ message: "optimizeSuccess" }),
+	);
+});
+
+test("a rich result never overwrites typing made while the request was running", async () => {
+	const editor = richEditor("original");
+	await act(async () => root.render(<RichProbe editor={editor.handle} />));
+	await act(async () => result.handleOptimize("clarify"));
+	await flush();
+	const changed = richEditor("new draft").getDocument();
+	editor.handle.setDocument(changed);
+	await act(async () => requests[0].resolve({ text: "stale optimized text" }));
+	expect(editor.getDocument()).toEqual(changed);
+	expect(notifications.show).toHaveBeenCalledWith(
+		expect.objectContaining({ message: "richComposer.optimizeChanged", color: "red" }),
+	);
+});
+
+test("moving the selection does not change the range an optimization replaces", async () => {
+	const editor = richEditor("hello world");
+	editor.select(6, 11);
+	await act(async () => root.render(<RichProbe editor={editor.handle} />));
+	await act(async () => result.handleOptimize("clarify"));
+	await flush();
+	expect(requests[0].text).toBe("world");
+	editor.select(0, 5);
+	await act(async () => requests[0].resolve({ text: "earth" }));
+	expect(editor.getDocument().paragraphs[0].children).toEqual([
+		{ type: "text", text: "hello earth" },
+	]);
+});
+
+test("a rich result rebinds to the remounted editor after draft hydration", async () => {
+	const previous = richEditor("alpha", "beta");
+	await act(async () => root.render(<RichProbe editor={previous.handle} />));
+	await act(async () => result.handleOptimize("clarify"));
+	await flush();
+	await act(async () => root.unmount());
+	const response = requests[0].text.replace("alpha", "ALPHA").replace("beta", "BETA");
+	await act(async () => requests[0].resolve({ text: response }));
+
+	const current = richEditor("");
+	root = createRoot(document.body.appendChild(document.createElement("div")));
+	await act(async () => root.render(<RichProbe editor={current.handle} ready={false} />));
+	expect(getPromptOptimizeTask("n")?.pendingDelivery).toBe(true);
+	current.handle.setDocument(previous.getDocument());
+	await act(async () => root.render(<RichProbe editor={current.handle} />));
+	expect(current.getDocument().paragraphs).toEqual([
+		{ children: [{ type: "text", text: "ALPHA" }] },
+		{ children: [{ type: "text", text: "BETA" }] },
+	]);
+	expect(previous.getDocument().paragraphs[0].children).toEqual([{ type: "text", text: "alpha" }]);
+	expect(getPromptOptimizeTask("n")).toBeUndefined();
+});
+
+test("an unavailable sibling surface cannot steal or discard the visible surface's result", async () => {
+	function Unavailable() {
+		usePromptOptimize({ narratorId: "n", textareaRef: { current: null } });
+		return null;
+	}
+	await act(async () =>
+		root.render(
+			<>
+				<Unavailable />
+				<Probe />
+			</>,
+		),
+	);
+	await act(async () => result.handleOptimize("clarify"));
+	await flush();
+	await act(async () => requests[0].resolve({ text: "optimized" }));
+	expect(applied).toEqual(["optimized"]);
+	expect(getPromptOptimizeTask("n")).toBeUndefined();
+});
+
+test("two ready surfaces apply a shared result only once", async () => {
+	await act(async () =>
+		root.render(
+			<>
+				<Probe />
+				<Probe />
+			</>,
+		),
+	);
+	await act(async () => result.handleOptimize("clarify"));
+	await flush();
+	await act(async () => requests[0].resolve({ text: "optimized", reasoningSummary: "rationale" }));
+	expect(applied).toEqual(["optimized"]);
+	expect(notifications.show).toHaveBeenCalledTimes(2);
+});
+
+test("closed surfaces do not consume results even if a textarea is still mounted", async () => {
+	function Closed() {
+		usePromptOptimize({
+			narratorId: "n",
+			ready: false,
+			textareaRef: {
+				current: {
+					value: "different hidden draft",
+					ownerDocument: document,
+				} as HTMLTextAreaElement,
+			},
+		});
+		return null;
+	}
+	await act(async () =>
+		root.render(
+			<>
+				<Closed />
+				<Probe />
+			</>,
+		),
+	);
+	await act(async () => result.handleOptimize("clarify"));
+	await flush();
+	await act(async () => requests[0].resolve({ text: "optimized" }));
+	expect(applied).toEqual(["optimized"]);
+	expect(notifications.show).toHaveBeenCalledWith(
+		expect.objectContaining({ message: "optimizeSuccess", color: "green" }),
+	);
+});
+
+test("delivery retries retain an unready result until the surface mounts", async () => {
+	const retries: Array<() => void> = [];
+	const setTimeout = globalThis.setTimeout;
+	const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+		...args: Parameters<typeof setTimeout>
+	) => {
+		const [callback, delay] = args;
+		if (delay === 250) {
+			retries.push(callback as () => void);
+			return 0;
+		}
+		return setTimeout(...args);
+	}) as typeof setTimeout);
+	restore.push(() => timer.mockRestore());
+	function Unavailable() {
+		usePromptOptimize({ narratorId: "n", textareaRef: { current: null } });
+		return null;
+	}
+	await act(async () => result.handleOptimize("clarify"));
+	await flush();
+	await act(async () => root.render(<Unavailable />));
+	await act(async () => requests[0].resolve({ text: "optimized" }));
+	await act(async () => {
+		for (let i = 0; i < 20; i++) retries.shift()?.();
+	});
+	expect(getPromptOptimizeTask("n")?.pendingDelivery).toBe(true);
+	await act(async () => root.render(<Probe />));
+	expect(applied).toEqual(["optimized"]);
 });

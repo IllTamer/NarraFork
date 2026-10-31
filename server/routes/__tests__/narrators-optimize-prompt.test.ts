@@ -1,8 +1,9 @@
 /**
  * `POST /api/narrators/:id/optimize-prompt`.
  *
- * The contract under test is what reaches the *composer*: only the optimized
- * prompt, never thinking text, a preamble or a fence. The model boundary is
+ * The contract under test is what reaches the *composer*: the optimized prompt
+ * intact, never a raw schema envelope. Only text fallback unwraps packaging.
+ * The model boundary is
  * stubbed at `summaryGenerate`, which is the single seam between this route and
  * the provider stack, so these tests drive the real route, schema handling and
  * fallback cleaning while fixing only the model's reply.
@@ -22,9 +23,16 @@ process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
  * Model replies queued by each test. The stub drains this queue so a single test
  * can observe exactly one call, and a stray extra call fails loudly.
  */
-type Reply = { text?: string; structured?: unknown; responseFormatDegraded?: string };
+type Reply = {
+	text?: string;
+	structured?: unknown;
+	responseFormatDegraded?: string;
+	outputTruncated?: boolean;
+	reasoningSummary?: string;
+};
+type ExtraOptions = { responseFormat?: unknown; onGenerationProgress?: () => void | Promise<void> };
 const replies: Reply[] = [];
-const calls: Array<{ text: string; extraOptions?: { responseFormat?: unknown } }> = [];
+const calls: Array<{ text: string; extraOptions?: ExtraOptions }> = [];
 
 const realAgent = { ...(await import("../../lib/agent")) };
 mock.module("../../lib/agent", () => ({
@@ -41,7 +49,7 @@ mock.module("../../lib/agent", () => ({
 		_onReasoningDelta?: unknown,
 		_onRetryProgress?: unknown,
 		_onRetryScheduled?: unknown,
-		extraOptions?: { responseFormat?: unknown },
+		extraOptions?: ExtraOptions,
 	) => {
 		calls.push({ text, extraOptions });
 		const next = replies.shift();
@@ -168,6 +176,17 @@ describe("structured output", () => {
 		expect(await optimize("写个登录页")).toBe("写一个登录页面，包含邮箱与密码字段。");
 	});
 
+	test.each([
+		"要求：\n实现安全查询。\n```sql\nSELECT 1\n```\n最后添加单元测试。",
+		"```typescript\nconst example = '<think>保留此示例</think>';\n```",
+		"<thinking>这是待解析的字面示例</thinking>\n保留整个输入，包括 <think>未闭合标签。",
+		"Optimized prompt:\n此行是正文中指定的标签。",
+		'"这一对引号也是正文内容。"',
+	])("preserves structured prompt content verbatim: %s", async (optimizedPrompt) => {
+		replies.push({ text: JSON.stringify({ optimizedPrompt }), structured: { optimizedPrompt } });
+		expect(await optimize("写个登录页")).toBe(optimizedPrompt);
+	});
+
 	test("a schema payload wins over unrelated text", async () => {
 		// The prose here is what a model would emit alongside structure; the
 		// whitelisted field is the only thing that may reach the composer.
@@ -200,6 +219,7 @@ describe("structured output", () => {
 		expect(format?.name).toBe("prompt_optimize_result");
 		expect(format?.schema.additionalProperties).toBe(false);
 		expect(format?.schema.required).toEqual(["optimizedPrompt", "reasoningSummary"]);
+		expect(calls[0]?.extraOptions?.onGenerationProgress).toBeFunction();
 	});
 
 	test("the draft is still sent inside the prompt tags", async () => {
@@ -221,7 +241,7 @@ describe("text fallback", () => {
 		expect(await optimize("写个登录页")).toBe("写一个登录页面，包含表单校验。");
 	});
 
-	test("strips a preamble and a trailing explanation", async () => {
+	test("strips a known preamble without guessing at trailing content", async () => {
 		replies.push({
 			text: "Here is the optimized prompt:\n\n写一个登录页面，包含表单校验。\n\nLet me know if you want changes.",
 			responseFormatDegraded: "relay rejected response_format",
@@ -254,13 +274,58 @@ describe("text fallback", () => {
 		expect(await optimize("写个登录页")).toBe("写个登录页");
 	});
 
-	test("a structured payload with a blank field falls through to text", async () => {
+	test("preserves prose requirements surrounding code and literal thinking tags", async () => {
+		const reply =
+			"要求：\n实现安全查询，识别 <think>示例</think>。\n```sql\nSELECT 1\n```\n最后添加单元测试。";
+		replies.push({ text: reply, responseFormatDegraded: "relay rejected response_format" });
+		expect(await optimize("写个登录页")).toBe(reply);
+	});
+});
+
+describe("invalid or incomplete schema output", () => {
+	test.each([
+		{},
+		{ optimizedPrompt: "   ", reasoningSummary: "没有可用正文。" },
+		{ optimizedPrompt: 42, reasoningSummary: "字段类型错误。" },
+	])("keeps the draft instead of the real raw JSON for invalid structure: %j", async (payload) => {
 		replies.push({
-			text: "写一个登录页面，包含表单校验。",
-			structured: { optimizedPrompt: "   " },
-			responseFormatDegraded: "field was blank",
+			text: JSON.stringify(payload),
+			structured: payload,
+			reasoningSummary: "此摘要也不应展示。",
 		});
-		expect(await optimize("写个登录页")).toBe("写一个登录页面，包含表单校验。");
+		const body = await optimizeRaw("写个登录页");
+		expect(body.text).toBe("写个登录页");
+		expect(body.reasoningSummary).toBeUndefined();
+	});
+
+	test("does not reinterpret invalid structured output as plaintext", async () => {
+		replies.push({ text: "不能验证这段输出。", structured: { optimizedPrompt: "   " } });
+		expect(await optimize("写个登录页")).toBe("写个登录页");
+	});
+
+	test.each([
+		'{"optimizedPrompt":"写一个登录页面，包含',
+		'```json\n{"reasoningSummary":"补充校验。","optimizedPrompt":42}\n```',
+	])("does not write an unparsed JSON envelope into the composer: %s", async (raw) => {
+		replies.push({ text: raw, responseFormatDegraded: "not a usable schema response" });
+		expect(await optimize("写个登录页")).toBe("写个登录页");
+	});
+
+	test("keeps the draft when truncation leaves an unclosed raw JSON envelope", async () => {
+		replies.push({
+			text: '{"optimizedPrompt":"写一个登录页面，包含',
+			outputTruncated: true,
+			reasoningSummary: "补充校验。",
+		});
+		const body = await optimizeRaw("写个登录页");
+		expect(body.text).toBe("写个登录页");
+		expect(body.reasoningSummary).toBeUndefined();
+	});
+
+	test("does not use even a parsed field when the generation was truncated", async () => {
+		const payload = { optimizedPrompt: "部分改写。", reasoningSummary: "未完成。" };
+		replies.push({ text: JSON.stringify(payload), structured: payload, outputTruncated: true });
+		expect(await optimize("写个登录页")).toBe("写个登录页");
 	});
 });
 

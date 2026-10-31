@@ -59,6 +59,7 @@ export function ComposerFullscreenModal({
 	const modalOptimize = usePromptOptimize({
 		narratorId: narratorId ?? "",
 		messageId,
+		ready: opened,
 		withContext: optimizeHook?.withContext,
 		textareaRef,
 		onOptimized: setText,

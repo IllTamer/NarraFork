@@ -67,6 +67,7 @@ import {
 	structuredResult,
 } from "./response-format";
 import {
+	isStructuredOutputRejection,
 	modelLacksNativeStructuredOutput,
 	rememberMissingNativeStructuredOutput,
 	structuredOutputRelayKey,
@@ -1042,7 +1043,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const bareModel = parseModelId(model).model;
 
 		// Native structured output first. A relay that has already proven it
-		// ignores the constraint is downgraded to restating the schema in the
+		// rejects or ignores the constraint is downgraded to restating the schema in the
 		// instruction instead — the fields are still recoverable, but the strict
 		// guarantee is gone.
 		const relayKey = structuredOutputRelayKey(this.apiMode, model);
@@ -1054,10 +1055,75 @@ export class OpenAIProvider implements ProviderAdapter {
 				: systemInstruction;
 		/** Learn from a native attempt that came back without structure. */
 		const learnFrom = (result: GenerateMetaResult): GenerateMetaResult => {
-			if (useNativeFormat && result.responseFormatDegraded) {
+			if (useNativeFormat && result.responseFormatDegraded && !result.outputTruncated) {
 				rememberMissingNativeStructuredOutput(relayKey);
 			}
 			return result;
+		};
+		const requestWithFallback = async (
+			body: Record<string, unknown>,
+			run: (body: Record<string, unknown>) => Promise<GenerateMetaResult>,
+		) => {
+			const responseFormat = options?.responseFormat;
+			if (!responseFormat) return withUnsupportedParameterFallback(model, body, run);
+			let nativeFormat = useNativeFormat;
+			const responses = usesResponsesEndpoint(this.apiMode);
+			const downgrade = () => {
+				options?.signal?.throwIfAborted();
+				nativeFormat = false;
+				rememberMissingNativeStructuredOutput(relayKey);
+				const fallbackInstruction = withSchemaInstruction(instruction, responseFormat);
+				if (responses) {
+					const textOptions = body.text as Record<string, unknown> | undefined;
+					if (textOptions) {
+						delete textOptions.format;
+						if (Object.keys(textOptions).length === 0) delete body.text;
+					}
+					body.instructions = fallbackInstruction;
+				} else {
+					delete body.response_format;
+					body.messages = [
+						{ role: "system", content: fallbackInstruction },
+						{ role: "user", content: text },
+					];
+				}
+			};
+			const attempt = async () => {
+				options?.signal?.throwIfAborted();
+				// The generic fallback may already have stripped this field, including
+				// from a previous request. Preserve the schema as an instruction then too.
+				const format = responses
+					? (body.text as Record<string, unknown> | undefined)?.format
+					: body.response_format;
+				if (nativeFormat && !format) downgrade();
+				try {
+					return await run(body);
+				} catch (error) {
+					if (
+						!nativeFormat ||
+						!isStructuredOutputRejection(error, responses ? "text.format" : "response_format")
+					) {
+						throw error;
+					}
+					downgrade();
+					return run(body);
+				}
+			};
+			omitUnsupportedParameters(body, model);
+			try {
+				return await attempt();
+			} catch (error) {
+				options?.signal?.throwIfAborted();
+				// Reuse the generic parameter recovery, but do not let it turn a
+				// non-400 or callback error into a schema capability downgrade.
+				if (
+					!(error instanceof ApiError) ||
+					error.status !== 400 ||
+					!stripUnsupportedParameter(body, model, error)
+				)
+					throw error;
+				return attempt();
+			}
 		};
 
 		if (usesResponsesEndpoint(this.apiMode)) {
@@ -1100,7 +1166,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			// request of the SAME turn and must replay the token the first
 			// response handed back (codex-rs sends it as an HTTP header here).
 			const turnState: { value: string | null } = { value: null };
-			const result = await withUnsupportedParameterFallback(model, body, (retryBody) =>
+			const result = await requestWithFallback(body, (retryBody) =>
 				this.requestResponsesTextWithMeta(
 					baseUrl,
 					apiKey,
@@ -1131,7 +1197,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (useNativeFormat && options?.responseFormat) {
 			body.response_format = openAIChatResponseFormat(options.responseFormat);
 		}
-		const result = await withUnsupportedParameterFallback(model, body, (retryBody) =>
+		const result = await requestWithFallback(body, (retryBody) =>
 			this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, retryBody, options?.signal, options),
 		);
 		return learnFrom(result);

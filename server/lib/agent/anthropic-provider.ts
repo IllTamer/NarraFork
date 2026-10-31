@@ -1110,6 +1110,7 @@ async function parseAnthropicGenerateResponse(
 			// append-only per tool-use id, matching how the stream is emitted.
 			const toolChunk = forcedToolName ? event.toolUseChunk : undefined;
 			if (toolChunk && toolChunk.name === forcedToolName) {
+				if (toolChunk.input || toolChunk.finalInput) await options?.onGenerationProgress?.();
 				if (toolChunk.finalInput !== undefined) {
 					toolArgs.set(toolChunk.toolUseId, toolChunk.finalInput);
 				} else if (toolChunk.input) {

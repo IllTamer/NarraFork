@@ -8,6 +8,7 @@
 import { describe, expect, test } from "bun:test";
 import { AnthropicProvider } from "../anthropic-provider";
 import { GeminiProvider } from "../gemini-provider";
+import { generateWithFirstTokenTimeout } from "../generate-first-token-timeout";
 import { OpenAIProvider } from "../openai-provider";
 import type { ResponseFormat } from "../provider";
 
@@ -266,6 +267,84 @@ describe("Anthropic forced-tool mode", () => {
 			'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
 			'event: message_stop\ndata: {"type":"message_stop"}\n\n',
 		].join("");
+
+	for (const scenario of ["complete", "empty", "cancel"] as const) {
+		test(`tool arguments count as first output, never text or reasoning (${scenario})`, async () => {
+			const realFetch = globalThis.fetch;
+			const request = new AbortController();
+			const encoder = new TextEncoder();
+			const textDeltas: string[] = [];
+			const reasoningDeltas: string[] = [];
+			let progress = 0;
+			let completed = false;
+			globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+				const signal = init?.signal;
+				const firstInput = scenario === "empty" ? "" : WITH_SUMMARY.slice(0, 20);
+				const sse = toolSse(firstInput);
+				const stop = sse.indexOf("event: content_block_stop");
+				const stream = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(encoder.encode(sse.slice(0, stop)));
+						const timer = setTimeout(() => {
+							signal?.removeEventListener("abort", onAbort);
+							const rest = `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: WITH_SUMMARY.slice(firstInput.length) } })}\n\n`;
+							controller.enqueue(encoder.encode(rest + sse.slice(stop)));
+							completed = true;
+							controller.close();
+						}, 60);
+						const onAbort = () => {
+							clearTimeout(timer);
+							controller.error(signal?.reason);
+						};
+						signal?.addEventListener("abort", onAbort, { once: true });
+					},
+				});
+				return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+			}) as typeof fetch;
+			try {
+				const pending = generateWithFirstTokenTimeout(
+					(options) =>
+						create().generateWithMeta("draft", "anthropic:claude-opus-4-5", "sys", {
+							...options,
+							responseFormat: FORMAT,
+							reasoningEffort: "none",
+							onTextDelta: (delta) => {
+								textDeltas.push(delta);
+								return options.onTextDelta?.(delta);
+							},
+							onReasoningDelta: (delta) => {
+								reasoningDeltas.push(delta);
+								return options.onReasoningDelta?.(delta);
+							},
+							onGenerationProgress: async () => {
+								progress++;
+								await options.onGenerationProgress?.();
+								if (scenario === "cancel") request.abort();
+							},
+						}),
+					20,
+					request.signal,
+				);
+				if (scenario === "complete") {
+					const result = await pending;
+					expect(result.structured).toEqual(JSON.parse(WITH_SUMMARY));
+					expect(result.text).toBe("");
+					expect(progress).toBeGreaterThan(0);
+					expect(completed).toBe(true);
+				} else {
+					await expect(pending).rejects.toMatchObject({
+						name: scenario === "empty" ? "TimeoutError" : "AbortError",
+					});
+					expect(completed).toBe(false);
+					if (scenario === "empty") expect(progress).toBe(0);
+				}
+				expect(textDeltas).toEqual([]);
+				expect(reasoningDeltas).toEqual([]);
+			} finally {
+				globalThis.fetch = realFetch;
+			}
+		});
+	}
 
 	test("declares the schema as a forced tool and parses its arguments", async () => {
 		const { request, result } = await drive(

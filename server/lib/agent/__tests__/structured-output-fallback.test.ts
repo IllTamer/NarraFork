@@ -8,7 +8,7 @@
  * and the reply is parsed with the same tolerant parser — every field survives,
  * only the *guarantee* is gone.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { OpenAIProvider } from "../openai-provider";
 import type { ResponseFormat } from "../provider";
 import {
@@ -19,6 +19,11 @@ import {
 	structuredOutputRelayKey,
 	withSchemaInstruction,
 } from "../structured-output-fallback";
+import { ApiError } from "../types";
+import {
+	resetUnsupportedParameterMemory,
+	withUnsupportedParameterFallback,
+} from "../unsupported-parameter-fallback";
 
 const FORMAT: ResponseFormat = {
 	type: "json_schema",
@@ -117,8 +122,29 @@ const responsesProvider = () =>
 		// biome-ignore lint/suspicious/noExplicitAny: test config subset
 	} as any);
 
+const realFetch = globalThis.fetch;
+
+function captureFetch(
+	respond: (attempt: number, signal?: AbortSignal | null) => Response | Promise<Response>,
+) {
+	const requests: Captured[] = [];
+	globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+		requests.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")) });
+		return respond(requests.length, init?.signal);
+	}) as typeof fetch;
+	return requests;
+}
+
+const rejection = (message: string, status = 400) =>
+	Response.json({ error: { message, type: "invalid_request_error" } }, { status });
+
 beforeEach(() => {
 	resetStructuredOutputFallbackMemory();
+	resetUnsupportedParameterMemory();
+});
+
+afterEach(() => {
+	globalThis.fetch = realFetch;
 });
 
 describe("learned relay memory", () => {
@@ -264,6 +290,187 @@ describe("OpenAI Responses downgrade", () => {
 		);
 		expect(request.body).toHaveProperty("text");
 		expect(request.body.instructions).toBe("sys");
+	});
+});
+
+describe("explicit structured-output rejection", () => {
+	for (const mode of ["completions", "responses"] as const) {
+		const create = mode === "completions" ? chatProvider : responsesProvider;
+		const parameter = mode === "completions" ? "response_format" : "text.format";
+		const key = structuredOutputRelayKey(mode, RELAY_MODEL);
+		const success = () =>
+			new Response(mode === "completions" ? chatSse(WITH_SUMMARY) : responsesSse([WITH_SUMMARY]), {
+				headers: { "content-type": "text/event-stream" },
+			});
+		const instructionOf = (body: Record<string, unknown>) =>
+			mode === "responses"
+				? String(body.instructions)
+				: (body.messages as Array<{ content: string }>)[0].content;
+		const nativeOf = (body: Record<string, unknown>) =>
+			mode === "responses"
+				? (body.text as { format?: unknown } | undefined)?.format
+				: body.response_format;
+
+		for (const message of [
+			`${parameter} is not supported`,
+			`Unsupported parameter: ${parameter}`,
+			`Invalid parameter: '${parameter}' of type 'json_schema' is not supported with this model.`,
+		]) {
+			test(`${mode}: ${message} retries once with the schema instruction, then remembers`, async () => {
+				const requests = captureFetch((attempt) =>
+					attempt === 1 ? rejection(message) : success(),
+				);
+				const provider = create();
+				const result = await provider.generateWithMeta("draft", RELAY_MODEL, "sys", {
+					responseFormat: FORMAT,
+				});
+				expect(requests).toHaveLength(2);
+				expect(nativeOf(requests[0].body)).toBeDefined();
+				expect(instructionOf(requests[0].body)).toBe("sys");
+				expect(nativeOf(requests[1].body)).toBeUndefined();
+				expect(instructionOf(requests[1].body)).toBe(withSchemaInstruction("sys", FORMAT));
+				expect(result.structured).toEqual(JSON.parse(WITH_SUMMARY));
+				expect(result.reasoningSummary).toBe("补充了字段与校验。");
+				expect(modelLacksNativeStructuredOutput(key)).toBe(true);
+				await provider.generateWithMeta("draft again", RELAY_MODEL, "sys", {
+					responseFormat: FORMAT,
+				});
+				expect(requests).toHaveLength(3);
+				expect(nativeOf(requests[2].body)).toBeUndefined();
+				expect(instructionOf(requests[2].body)).toBe(withSchemaInstruction("sys", FORMAT));
+			});
+		}
+
+		for (const message of [
+			"Invalid input",
+			`Invalid schema for ${parameter}: property not supported`,
+		]) {
+			test(`${mode}: unrelated 400 does not retry or learn (${message})`, async () => {
+				const requests = captureFetch(() => rejection(message));
+				await expect(
+					create().generateWithMeta("draft", RELAY_MODEL, "sys", { responseFormat: FORMAT }),
+				).rejects.toMatchObject({ name: "ApiError", status: 400 });
+				expect(requests).toHaveLength(1);
+				expect(modelLacksNativeStructuredOutput(key)).toBe(false);
+			});
+		}
+
+		for (const status of [401, 500]) {
+			test(`${mode}: format wording in HTTP ${status} does not downgrade`, async () => {
+				const requests = captureFetch(() =>
+					rejection(`Unsupported parameter: ${parameter}`, status),
+				);
+				await expect(
+					create().generateWithMeta("draft", RELAY_MODEL, "sys", { responseFormat: FORMAT }),
+				).rejects.toMatchObject({ name: "ApiError", status });
+				expect(requests).toHaveLength(1);
+				expect(modelLacksNativeStructuredOutput(key)).toBe(false);
+			});
+		}
+
+		for (const schemaFirst of [true, false]) {
+			test(`${mode}: schema and generic parameter fallback cooperate (schema first: ${schemaFirst})`, async () => {
+				const limit = mode === "completions" ? "max_tokens" : "max_output_tokens";
+				const rejected = schemaFirst ? [parameter, limit] : [limit, parameter];
+				const requests = captureFetch((attempt) =>
+					attempt <= 2 ? rejection(`Unsupported parameter: ${rejected[attempt - 1]}`) : success(),
+				);
+				const result = await create().generateWithMeta("draft", RELAY_MODEL, "sys", {
+					responseFormat: FORMAT,
+					maxOutputTokens: 1024,
+				});
+				expect(requests).toHaveLength(3);
+				expect(requests[0].body[limit]).toBe(1024);
+				expect(nativeOf(requests[0].body)).toBeDefined();
+				expect(requests[2].body[limit]).toBeUndefined();
+				expect(nativeOf(requests[2].body)).toBeUndefined();
+				expect(instructionOf(requests[2].body)).toBe(withSchemaInstruction("sys", FORMAT));
+				expect(result.structured).toEqual(JSON.parse(WITH_SUMMARY));
+			});
+		}
+
+		test(`${mode}: callback failure is not mistaken for a rejected API parameter`, async () => {
+			const error = new Error(`Unsupported parameter: ${parameter}`);
+			const requests = captureFetch(success);
+			await expect(
+				create().generateWithMeta("draft", RELAY_MODEL, "sys", {
+					responseFormat: FORMAT,
+					onTextDelta: () => {
+						throw error;
+					},
+				}),
+			).rejects.toBe(error);
+			expect(requests).toHaveLength(1);
+			expect(modelLacksNativeStructuredOutput(key)).toBe(false);
+		});
+
+		test(`${mode}: a failed text fallback is not retried again`, async () => {
+			const requests = captureFetch(() => rejection(`Unsupported parameter: ${parameter}`));
+			await expect(
+				create().generateWithMeta("draft", RELAY_MODEL, "sys", { responseFormat: FORMAT }),
+			).rejects.toMatchObject({ name: "ApiError", status: 400 });
+			expect(requests).toHaveLength(2);
+		});
+
+		for (const cancelOnAttempt of [1, 2]) {
+			test(`${mode}: cancellation on attempt ${cancelOnAttempt} stops fallback`, async () => {
+				const controller = new AbortController();
+				const reason = new DOMException("Cancelled", "AbortError");
+				const requests = captureFetch((attempt, signal) => {
+					expect(signal).toBe(controller.signal);
+					if (attempt === cancelOnAttempt) controller.abort(reason);
+					if (attempt === 1) return rejection(`${parameter} is not supported`);
+					signal?.throwIfAborted();
+					return success();
+				});
+				await expect(
+					create().generateWithMeta("draft", RELAY_MODEL, "sys", {
+						responseFormat: FORMAT,
+						signal: controller.signal,
+					}),
+				).rejects.toBe(reason);
+				expect(requests).toHaveLength(cancelOnAttempt);
+				if (cancelOnAttempt === 1) expect(modelLacksNativeStructuredOutput(key)).toBe(false);
+			});
+		}
+
+		test(`${mode}: truncated JSON does not teach a permanent capability failure`, async () => {
+			const partial = '{"optimizedPrompt":"';
+			const truncated =
+				mode === "completions"
+					? `data: ${JSON.stringify({ choices: [{ delta: { content: partial }, finish_reason: "length" }] })}\n\ndata: [DONE]\n\n`
+					: `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: partial })}\n\nevent: response.incomplete\ndata: ${JSON.stringify({ type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } } })}\n\n`;
+			const requests = captureFetch((attempt) =>
+				attempt === 1
+					? new Response(truncated, { headers: { "content-type": "text/event-stream" } })
+					: success(),
+			);
+			const provider = create();
+			const result = await provider.generateWithMeta("draft", RELAY_MODEL, "sys", {
+				responseFormat: FORMAT,
+			});
+			expect(result.outputTruncated).toBe(true);
+			expect(result.responseFormatDegraded).toBeDefined();
+			expect(modelLacksNativeStructuredOutput(key)).toBe(false);
+			await provider.generateWithMeta("draft", RELAY_MODEL, "sys", { responseFormat: FORMAT });
+			expect(nativeOf(requests[1].body)).toBeDefined();
+		});
+	}
+
+	test("a response_format removed by the generic fallback still becomes an instruction", async () => {
+		let attempts = 0;
+		await withUnsupportedParameterFallback(RELAY_MODEL, { response_format: {} }, async () => {
+			if (++attempts === 1) throw new ApiError(400, "Unsupported parameter: response_format");
+		});
+		const { request, result } = await drive(chatProvider(), chatSse(WITH_SUMMARY), (provider) =>
+			provider.generateWithMeta("draft", RELAY_MODEL, "sys", { responseFormat: FORMAT }),
+		);
+		expect(request.body.response_format).toBeUndefined();
+		expect((request.body.messages as Array<{ content: string }>)[0].content).toBe(
+			withSchemaInstruction("sys", FORMAT),
+		);
+		expect(result.structured).toEqual(JSON.parse(WITH_SUMMARY));
+		expect(modelLacksNativeStructuredOutput(CHAT_KEY)).toBe(true);
 	});
 });
 

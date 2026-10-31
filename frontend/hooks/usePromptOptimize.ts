@@ -9,6 +9,7 @@ import {
 	claimPromptOptimizeDelivery,
 	getPromptOptimizeTask,
 	type OptimizeStyle,
+	type PromptOptimizeSnapshot,
 	promptOptimizeTaskKey,
 	releasePromptOptimizeSurface,
 	startPromptOptimizeTask,
@@ -30,6 +31,8 @@ export interface UsePromptOptimizeOptions {
 	narratorId: string;
 	messageId?: string; // For editing message context
 	withContext?: boolean; // Shared context preference for an alternate editor
+	/** False while a draft is hydrating or an alternate view is closed. */
+	ready?: boolean;
 	textareaRef: RefObject<HTMLTextAreaElement | null>;
 	/**
 	 * Callback after successful optimization.
@@ -37,7 +40,11 @@ export interface UsePromptOptimizeOptions {
 	 */
 	onOptimized?: (text: string) => void;
 	/** Structured editors capture a versioned text-only transformation; atoms never enter the prompt. */
-	target?: () => { text: string; apply: (text: string) => boolean } | null;
+	target?: (snapshot?: PromptOptimizeSnapshot) => {
+		text: string;
+		snapshot: PromptOptimizeSnapshot;
+		apply: (text: string) => boolean;
+	} | null;
 }
 
 export interface UsePromptOptimizeResult {
@@ -129,15 +136,15 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 	const deliverOnce = useCallback(
 		(current: NonNullable<ReturnType<typeof getPromptOptimizeTask>>): boolean => {
 			const opts = optionsRef.current;
-			const target = opts.target?.();
+			if (opts.ready === false) return false;
+			const target = opts.target?.(current.snapshot);
 			const textarea = opts.textareaRef.current;
 			const text = current.resultText ?? "";
 			const errorText = current.error ?? "";
 
-			// Another surface showing this same draft may have claimed it first (the
-			// inline composer and the fullscreen view share one task key). Claiming
-			// is atomic, so only one of them writes.
-			if (!claimPromptOptimizeDelivery(current.key, current.requestId)) return true;
+			// Never reserve a delivery for a surface that cannot apply it yet.
+			if (current.status !== "failed" && !target && !textarea) return false;
+			if (!claimPromptOptimizeDelivery(current.key, current.requestId)) return false;
 
 			if (current.status === "failed") {
 				// Reported once, then released — a failed task has nothing to deliver.
@@ -145,8 +152,6 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 				notifyFailure(errorText);
 				return true;
 			}
-
-			if (!target && !textarea) return false; // Surface not rendered yet.
 
 			let applied = true;
 			try {
@@ -211,7 +216,7 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 	/** The key the claimed task actually lives under — it may be a sibling's. */
 	const pendingKey = task?.key ?? key;
 	useEffect(() => {
-		if (!pendingRequestId || pendingStatus === "running") return;
+		if (options.ready === false || !pendingRequestId || pendingStatus === "running") return;
 		if (deliveredRef.current.has(pendingRequestId)) {
 			// Already applied by an earlier mount of this component.
 			acknowledgePromptOptimizeDelivery(pendingKey, pendingRequestId);
@@ -226,11 +231,13 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 			const current = getPromptOptimizeTask(pendingKey);
 			// A superseding request replaced this one — nothing to deliver.
 			if (!current || current.requestId !== pendingRequestId) return;
-			if (deliverOnce(current) || ++attempts >= DELIVERY_MAX_ATTEMPTS) {
+			if (deliverOnce(current)) {
 				acknowledgePromptOptimizeDelivery(pendingKey, pendingRequestId);
 				return;
 			}
-			timer = setTimeout(attempt, DELIVERY_RETRY_MS);
+			if (++attempts < DELIVERY_MAX_ATTEMPTS) {
+				timer = setTimeout(attempt, DELIVERY_RETRY_MS);
+			}
 		};
 		attempt();
 
@@ -238,7 +245,7 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 			cancelled = true;
 			if (timer) clearTimeout(timer);
 		};
-	}, [pendingRequestId, pendingStatus, pendingKey, deliverOnce]);
+	}, [pendingRequestId, pendingStatus, pendingKey, deliverOnce, options.ready]);
 
 	const handleOptimize = useCallback(
 		async (style: OptimizeStyle) => {
@@ -261,6 +268,7 @@ export function usePromptOptimize(options: UsePromptOptimizeOptions): UsePromptO
 				narratorId: optionsRef.current.narratorId,
 				messageId: optionsRef.current.messageId,
 				text: originalText,
+				snapshot: target?.snapshot,
 				style,
 				withContext: useContext,
 			});
