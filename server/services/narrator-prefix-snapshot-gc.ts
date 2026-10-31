@@ -1,3 +1,4 @@
+import { bodySql } from "../lib/narrator-bodies";
 import { isPrefixToolsManifest, PREFIX_TOOLS_FORMAT } from "./narrator-prefix-snapshot-values";
 
 export const PREFIX_SNAPSHOT_GRACE_MS = 24 * 60 * 60 * 1000;
@@ -108,7 +109,9 @@ export class PrefixSnapshotCollector {
 				if (rows.length < batch) next("messages");
 			} else if (state.phase === "messages" || state.phase === "blocks") {
 				const table = state.phase === "messages" ? "narrator_messages" : "narrator_blocks";
-				const column = state.phase === "messages" ? "content_json" : "payload";
+				// Preserve legacy projections as conservative roots through the body layer;
+				// the separate blocks phase also protects current/rows-only bodies.
+				const column = state.phase === "messages" ? bodySql(table, false) : "payload";
 				// One body at a time: one historical item may itself be arbitrarily large.
 				const rows = await this.query<{ id: string }>(
 					`SELECT id FROM ${table} WHERE id > ? ORDER BY id LIMIT ?`,
