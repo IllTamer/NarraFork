@@ -31,6 +31,7 @@ import {
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 	MAX_STAGED_ATTACHMENTS_TOTAL_BYTES,
 } from "@shared/text-file-types";
+import { parseWorkspaceDirectoryMap, readDeviceDirectory } from "@shared/workspace-directories";
 import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -658,6 +659,12 @@ async function resolveNarratorProjectId(narratorId: string): Promise<string | nu
 export async function getNarratorExecutionDeviceState(narratorId: string): Promise<{
 	defaultDeviceId: string | null;
 	devices: NonNullable<import("../lib/agent").AgentConfig["availableDevices"]>;
+	/**
+	 * Working directory recorded per device. The device picker needs this to tell
+	 * "switch there" from "enter a directory first", and the details panel renders
+	 * each device with its own directory.
+	 */
+	directories: import("@shared/workspace-directories").WorkspaceDirectoryMap;
 }> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -667,9 +674,11 @@ export async function getNarratorExecutionDeviceState(narratorId: string): Promi
 	const projectId = await resolveNarratorProjectId(narratorId);
 	const runtime = await assertOAuthNarratorRuntimeActive(narratorId);
 	const devices = (await resolveSessionDevices(projectId)) ?? [];
+	const { getWorkspaceDirectories } = await import("./workspace-context-service");
 	return {
 		defaultDeviceId: runtime?.defaultDeviceId ?? narrator.defaultDeviceId,
 		devices: runtime ? filterOAuthSessionDevices(devices, runtime) : devices,
+		directories: await getWorkspaceDirectories(narratorId),
 	};
 }
 
@@ -1368,6 +1377,7 @@ export async function buildSystemPrompt(
 		| "runtimeHints"
 		| "taskSection"
 		| "contextParts"
+		| "outlinePlan"
 	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
@@ -1426,11 +1436,24 @@ async function createNarrator(
 		narrator.workspaceContext.deviceId === "local"
 			? narrator.workspaceContext.cwd
 			: null;
+	/**
+	 * `narrator.cwd` is the *currently effective* directory, which on a remote device is
+	 * a path that does not exist on this server. The session's own local directory — the
+	 * base for local tool calls and skills, and what a switch back to `local` restores —
+	 * is the `local` entry of the per-device map.
+	 */
+	const localDeviceCwd =
+		executionDeviceId === "local"
+			? null
+			: readDeviceDirectory(parseWorkspaceDirectoryMap(narrator.workspaceDirectories), "local")
+					?.cwd;
 	// A former chapter session's directory came from its committed workspace first (its
 	// own cwd column was often never written); every other session keeps its own cwd first.
-	const storedCwd = isFormerChapterSessionWithoutDirectory({ cwd: null, traits: narrator.traits })
-		? committedLocalCwd || narrator.cwd
-		: narrator.cwd || committedLocalCwd;
+	const storedCwd =
+		localDeviceCwd ??
+		(isFormerChapterSessionWithoutDirectory({ cwd: null, traits: narrator.traits })
+			? committedLocalCwd || narrator.cwd
+			: narrator.cwd || committedLocalCwd);
 	if (
 		executionDeviceId === "local" &&
 		isFormerChapterSessionWithoutDirectory({ cwd: storedCwd, traits: narrator.traits })
@@ -1514,6 +1537,21 @@ async function createNarrator(
 				await resolveTaskBackend(narratorId).catch(() => "spec" as const),
 				narrator.type,
 			),
+			// An outline session plans in the outline (outline P2 PR 8).
+			...(isPlanMode
+				? await (async () => {
+						const planMode = await import("./outline-plan-mode");
+						const view = await planMode.outlinePlanPromptRoot(narratorId);
+						if (!view) return {};
+						const { resolveEffectiveRelaxedPlan } = await import("../lib/permission-modes");
+						return {
+							outlinePlan: {
+								root: view.root,
+								relaxed: resolveEffectiveRelaxedPlan(narrator.permissionMode, narrator.relaxedPlan),
+							},
+						};
+					})()
+				: {}),
 		},
 	);
 
@@ -6390,6 +6428,18 @@ async function reExecuteDeniedToolCallUnlocked(
 					if (!result.isError && toolName === "ExitPlanMode") {
 						const { exitNarratorPlanMode } = await import("./narrator-plan-mode");
 						const planState = await exitNarratorPlanMode(narratorId);
+						// An outline session's plan is recorded as approved (a draft: outline P2 PR 8).
+						const { settleApprovedOutlinePlan } = await import("./outline-plan-mode");
+						await settleApprovedOutlinePlan({
+							narratorId,
+							toolUseId,
+							locale: active.locale,
+							approverUserId: userId ?? null,
+							turnUserId: active._currentUserId ?? null,
+							byReview: false,
+							// The input as just resolved: the row is written after this (review N2).
+							input: (result.updatedInput as Record<string, unknown> | undefined) ?? null,
+						});
 						active._preparedPlanModes?.clear();
 						active._planFileId = undefined;
 						active._planFilePath = undefined;

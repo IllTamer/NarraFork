@@ -91,6 +91,7 @@ import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUse
 import {
 	useUpdateExecutionDevice,
 	useWorkspaceContext,
+	workspaceDirectoryRequiredDeviceId,
 	workspaceFileTarget,
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
@@ -129,6 +130,7 @@ import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
+import { MobileNavButton } from "../nav/MobileNavButton";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { NarratorProjectSettingsModal } from "../project/NarratorProjectSettings";
@@ -148,6 +150,7 @@ import {
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
+import { DeviceDirectoryDialog } from "./header/DeviceDirectoryDialog";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
@@ -506,9 +509,22 @@ function NarratorPanelBody({
 		// 设备列表变化缓慢, 60s 轮询足够
 		refetchInterval: 60_000,
 	});
-	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) =>
-		notifications.show({ color: "red", message: error.message }),
-	);
+	// A device with no recorded directory refuses the switch; that is a prompt, not a
+	// failure, so it opens the directory dialog instead of a red toast. The dialog is
+	// mounted here (outside the header and overflow menus) so both entry points share it.
+	const [directoryDeviceId, setDirectoryDeviceId] = useState<string | null>(null);
+	const requireDeviceDirectory = useCallback((deviceId: string) => {
+		setDirectoryDeviceId(deviceId);
+	}, []);
+	const closeDeviceDirectoryDialog = useCallback(() => setDirectoryDeviceId(null), []);
+	const updateExecutionDeviceMutation = useUpdateExecutionDevice(narratorId, (error) => {
+		const missingDirectoryDevice = workspaceDirectoryRequiredDeviceId(error);
+		if (missingDirectoryDevice) {
+			requireDeviceDirectory(missingDirectoryDevice);
+			return;
+		}
+		notifications.show({ color: "red", message: error.message });
+	});
 	const updateSettingsMutation = useMutation({
 		mutationFn: api.updateSettings,
 		onSuccess: (data) => {
@@ -623,6 +639,10 @@ function NarratorPanelBody({
 		onMinimize,
 		onBack,
 	});
+	// The panel is the phone's whole page (the route hands it the horizontal safe areas
+	// for exactly that case), so its header is the top of the screen and carries the
+	// menu button: phones have no header row of their own.
+	const showMobileNav = ownsHorizontalSafeArea && isMobileViewport;
 
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
@@ -2802,6 +2822,7 @@ function NarratorPanelBody({
 		toggleTerminalTool,
 		toggleSpecTool,
 		updateExecutionDeviceMutation,
+		onRequireDeviceDirectory: requireDeviceDirectory,
 		renderLod,
 		renderLodIsDefault,
 		handleSelectLod,
@@ -2816,6 +2837,7 @@ function NarratorPanelBody({
 		() => ({
 			executionDevicesQuery,
 			updateExecutionDeviceMutation,
+			onRequireDeviceDirectory: requireDeviceDirectory,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -2825,6 +2847,7 @@ function NarratorPanelBody({
 		[
 			executionDevicesQuery,
 			updateExecutionDeviceMutation,
+			requireDeviceDirectory,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -3144,6 +3167,15 @@ function NarratorPanelBody({
 					{...dropZoneProps}
 				>
 					{toolbarController.toolbarOverlays}
+					<DeviceDirectoryDialog
+						narratorId={narratorId}
+						deviceId={directoryDeviceId}
+						deviceName={
+							executionDevicesQuery.data?.devices.find((device) => device.id === directoryDeviceId)
+								?.name
+						}
+						onClose={closeDeviceDirectoryDialog}
+					/>
 					<NugRechargeDialog
 						opened={nugRechargeOpened}
 						narratorId={narratorId}
@@ -3160,6 +3192,7 @@ function NarratorPanelBody({
 					<NarratorHeaderLayout
 						titleFullWidth={headerTitleFullWidth}
 						showBack={showLeadingChrome}
+						showMenu={showMobileNav}
 						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
 						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
 						showClose={!!onClose}
@@ -3180,6 +3213,8 @@ function NarratorPanelBody({
 										overflow: "hidden",
 									}}
 								>
+									{/* Phones: this row is the top of the screen, so it opens the drawer. */}
+									{showMobileNav && <MobileNavButton />}
 									{showLeadingChrome &&
 										(onBack ? (
 											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>
